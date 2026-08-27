@@ -4,7 +4,8 @@
 
 **Revision 2** — reworked after confirmation that the tunnel must appear as a managed interface
 in LuCI, and that the target device has ample storage. Both changed the architecture; see
-[What changed in revision 2](#what-changed-in-revision-2).
+[What changed in revision 2](#what-changed-in-revision-2). VPS server provisioning is now in
+scope as [Phase S](#phase-s--vps-server).
 
 ## What this is
 
@@ -13,6 +14,9 @@ on a router and exposes it as a **first-class network interface**. It appears un
 Network → Interfaces in LuCI with working Start / Stop / Restart buttons and a configuration
 form, is assignable to a firewall zone, and carries LAN traffic with no client-side setup on
 any device.
+
+It also covers provisioning the VPS end of the tunnel ([Phase S](#phase-s--vps-server)), since
+both halves must agree on provider, room, transport and key before anything works.
 
 | Target | Package format | Role |
 |---|---|---|
@@ -287,6 +291,77 @@ phase now targets the assumptions that can still invalidate the design:
    it.
 5. Measure binary size and idle/loaded RAM for the record, not as a gate.
 
+### Phase S — VPS server
+
+**Target: Ubuntu 24.04 LTS, x86_64.** Delivered as an idempotent, commented provisioning
+script for review before execution — I do not drive the host, and no hostname, address or
+credential is requested or stored.
+
+Independent of the router work, so it can run in parallel with Phases 1–3. It must be done
+before Phase 6, since end-to-end testing needs both ends.
+
+**The server needs no inbound ports.** Verified in upstream source: `internal/server/` contains
+no `net.Listen` of any kind. Both ends *join* the conference outbound, so the VPS never accepts
+an incoming connection. The firewall stays default-deny inbound with SSH as the only exception —
+no port forwarding, no exposed listener, nothing to scan. This is a real advantage over every
+DTLS-based project in this survey, where the server is an open UDP listener that anyone
+reaching the port can hand traffic to.
+
+The x86_64 target already in the build matrix produces the server binary, so the VPS consumes
+the same signed artifact as everything else. No Go toolchain is installed on the VPS.
+
+1. **Baseline** on the fresh host: `apt` update and full-upgrade, `unattended-upgrades` enabled
+   for security updates, SSH hardened to key-only with `PasswordAuthentication no`, and `ufw`
+   set to `default deny incoming` / `default allow outgoing` with SSH as the sole exception.
+   The SSH change is applied last and verified over a second session before the first is
+   closed, so a mistake cannot lock you out of a remote host.
+2. **Unprivileged service account** — system user, no shell, no home directory, no login.
+3. **Binary** installed from our release with its `SHA256SUMS` verified before install. Not
+   piped from a URL into a root shell; that pattern is one of the recurring weaknesses in this
+   ecosystem and there is no reason to repeat it.
+4. **Shared key** — `openssl rand -hex 32`, written to `/etc/olcrtc/olcrtc.key` mode `0600`
+   owned by the service account, referenced from the config as `crypto.key_file` so the secret
+   never sits inline in YAML. The same value goes to the router's key file. It is transferred
+   out of band — never through this repository, a chat window, or a config backup.
+5. **Server config** — `mode: srv`, matching `provider`, `room` and `net.transport`, with
+   `key_file` rather than `key`. Client and server must agree on all four or the link silently
+   never forms.
+6. **systemd unit, hardened.** The survey found installers in this ecosystem writing units that
+   run as root with, in one case, "not one hardening directive" for a process terminating
+   untrusted traffic. This one runs unprivileged with an empty capability set:
+
+   ```ini
+   User=olcrtc
+   NoNewPrivileges=true
+   ProtectSystem=strict
+   ProtectHome=true
+   PrivateTmp=true
+   PrivateDevices=true
+   ProtectKernelTunables=true
+   ProtectKernelModules=true
+   ProtectControlGroups=true
+   RestrictNamespaces=true
+   LockPersonality=true
+   SystemCallArchitectures=native
+   CapabilityBoundingSet=
+   AmbientCapabilities=
+   RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX
+   ReadWritePaths=/var/lib/olcrtc
+   Restart=always
+   RestartSec=5
+   ```
+
+   Two of those need care rather than copying. `AF_NETLINK` is required — Go's `net` package
+   enumerates interfaces over netlink, and olcRTC's `internal/protect` walks interfaces to
+   filter ICE candidates, so omitting it breaks candidate gathering in a way that looks like a
+   network fault. `MemoryDenyWriteExecute` is deliberately absent pending a test; Go does not
+   JIT, so it should be safe, but it is verified before being added rather than assumed.
+7. **Verify** the server joins the room and the link establishes, before any router work
+   depends on it.
+
+Deliverable: a reviewed provisioning script plus a step-by-step document, both idempotent and
+both re-runnable. No hostname, address or credential appears in the repository.
+
 ### Phase 1 — Build pipeline
 Cross-compile from the pin across the matrix; publish checksummed artifacts. Deliverable: a
 binary per architecture, reproducible from a clean checkout.
@@ -371,20 +446,38 @@ defaults to Jitsi, which needs no account at all.
 
 ---
 
-## Remaining open question
+## Settled
 
-**Server-side scope.** This plan covers the router client only, and assumes an `olcrtc srv`
-already running on a VPS with a matching room and key. Say if provisioning that should also be
-in scope — it would add a phase, and the natural shape is a deploy script rather than a package.
+25.12 primary with 24.10 alongside · storage is ample, so footprint is not a constraint · CI
+does not touch a device · **the VPS server is in scope** and is covered by Phase S.
 
-Everything else is settled: 25.12 primary with 24.10 alongside, storage is ample, and CI does
-not touch a device.
+Nothing is outstanding. Every question this plan raised has an answer:
+
+| Question | Answer |
+|---|---|
+| OpenWrt releases | 25.12 (apk) primary, 24.10 (ipk) alongside |
+| Routing | Transparent, whole-LAN, via a TUN interface in LuCI |
+| Architectures | `aarch64_cortex-a53`, `aarch64_cortex-a72`, `arm_cortex-a7`, `x86_64` |
+| Upstream | Pinned commit, built with official Go |
+| Storage | Ample; footprint is not a constraint |
+| CI device deploy | No — Phase 6 is manual |
+| Server side | In scope. Ubuntu 24.04 LTS, x86_64, script you review then run |
 
 ---
 
 ## Confirm before I start
 
-Approve the switch to a TUN-based data path with sing-box (the change that makes LuCI
-integration possible), the two-package split, and the fail-closed defaults in Phase 4 — then
-answer the server-side question above. Phase 0 runs first regardless, since sing-box
-availability can still change the shape of Phase 3.
+One decision needs your approval, because it reverses a choice from revision 1: **the data path
+becomes a TUN interface driven by sing-box, instead of nftables redirection into redsocks.**
+That switch is what makes the LuCI Interfaces requirement achievable at all, and the storage
+headroom is what makes it affordable. Approving it also means accepting sing-box as a second
+runtime dependency alongside olcRTC.
+
+Alongside that, please confirm the two-package split (`olcrtc` + `luci-proto-olcrtc`) and the
+fail-closed defaults in Phase 4 — the DNS, QUIC and IPv6 rejections. Those defaults will make
+some traffic visibly fail rather than silently leak, which is the correct trade for a
+circumvention tool but is worth agreeing to deliberately rather than discovering later.
+
+On approval I start with **Phase 0** and **Phase S** together, since they are independent:
+Phase 0 answers whether sing-box is available for each target, and Phase S gives you a working
+server to test against. Neither writes anything to your hosts without you reading it first.
