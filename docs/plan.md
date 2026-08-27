@@ -2,17 +2,28 @@
 
 **Status: awaiting confirmation.** Nothing has been built yet. This document is the proposal.
 
+**Revision 2** — reworked after confirmation that the tunnel must appear as a managed interface
+in LuCI, and that the target device has ample storage. Both changed the architecture; see
+[What changed in revision 2](#what-changed-in-revision-2).
+
 ## What this is
 
 An OpenWrt package that runs the [olcRTC](https://github.com/openlibrecommunity/olcrtc) client
-on a router and transparently routes LAN traffic through it, so no device on the network needs
-any client-side configuration.
+on a router and exposes it as a **first-class network interface**. It appears under
+Network → Interfaces in LuCI with working Start / Stop / Restart buttons and a configuration
+form, is assignable to a firewall zone, and carries LAN traffic with no client-side setup on
+any device.
 
-Distributed as an **apk** package — OpenWrt's package format since 24.10, built on Alpine's
-`apk-tools`. This is unrelated to Android APKs. An **ipk** is produced from the same build for
-OpenWrt 23.05 and earlier.
+| Target | Package format | Role |
+|---|---|---|
+| OpenWrt 25.12 | **apk** | Primary |
+| OpenWrt 24.10 | **ipk** (opkg) | Built and published alongside |
 
-The package is architecture-agnostic by construction: adding a router family is one row in a
+Both come from one build. 24.10 predates the apk migration, so it takes ipk; 25.12 is the first
+release where apk is the default. Phase 0 confirms this against the actual devices rather than
+trusting the version numbers.
+
+The package is architecture-agnostic by construction — adding a router family is one row in a
 build matrix, because olcRTC is pure Go and builds with `CGO_ENABLED=0`.
 
 ---
@@ -20,25 +31,29 @@ build matrix, because olcRTC is pure Go and builds with `CGO_ENABLED=0`.
 ## The constraint that shapes everything
 
 olcRTC's client is a **SOCKS5 proxy that speaks CONNECT only, and its server egress dials
-`tcp4`**. Verified in the upstream source rather than inferred:
+`tcp4`**. Verified in upstream source rather than inferred:
 
 - `internal/client/socks.go` — `socks5Request` rejects any command byte other than `1`, so
   there is no `UDP ASSOCIATE` (`0x03`) and no `BIND` (`0x02`).
 - `internal/server/egress.go` — `dialer.Dial("tcp4", addr)`, hardcoded.
 
-**Consequence: the tunnel carries TCP over IPv4. It cannot carry UDP, and it cannot carry
-IPv6.** Every design decision below follows from this. Three things break if it is ignored:
+**The tunnel carries TCP over IPv4. It cannot carry UDP, and it cannot carry IPv6.**
 
-| Traffic | What happens if unhandled |
+This matters *more* now that the design uses a TUN interface, not less. A TUN device accepts
+every packet the routing table sends it — UDP, IPv6, everything — and the tunnel behind it can
+only carry a subset. Anything else must be explicitly rejected at the interface, or it becomes
+a silent failure or a leak:
+
+| Traffic | Unhandled outcome |
 |---|---|
-| DNS (UDP/53) | Cannot traverse the tunnel. Resolves via the router's normal path — a plaintext leak that also reveals every domain visited. |
-| QUIC / HTTP3 (UDP/443) | Cannot traverse. Browsers prefer it, so pages hang until they fall back, or fail outright. |
+| DNS (UDP/53) | Cannot traverse. Falls back to the router's normal resolver — a plaintext leak that also reveals every domain visited. |
+| QUIC / HTTP3 (UDP/443) | Cannot traverse. Browsers prefer it, so pages stall until they fall back, or fail outright. |
 | IPv6 | Cannot traverse. If the LAN has working IPv6, that traffic exits the WAN in the clear while the user believes they are tunnelled. |
 
-That last row is not hypothetical. It is the single most serious defect found in
-`SpaceNeuroX/qwdtt-openwrt`, the closest comparable project in this survey — it is IPv4-only by
-construction and never tells the operator to disable IPv6. **This package fails closed on all
-three by default** (see Phase 4).
+The IPv6 row is not hypothetical: it is the most serious defect in `SpaceNeuroX/qwdtt-openwrt`,
+the closest comparable project in this survey — IPv4-only by construction, with a README that
+never tells the operator to disable IPv6. **This package fails closed on all three by default**
+(Phase 4).
 
 ---
 
@@ -48,53 +63,127 @@ three by default** (see Phase 4).
 LAN device (no configuration)
     │
     ▼
-br-lan
-    │  nftables: TCP → REDIRECT to 127.0.0.1:1088
-    │            UDP/443 → reject   (forces QUIC→TCP fallback)
-    │            IPv6 forward → reject
-    ▼
-redsocks            reads SO_ORIGINAL_DST, forwards to SOCKS5
+br-lan ──▶ routing table ──▶ olcrtc0        ← real TUN device, managed by netifd,
+    │                            │             visible and controllable in LuCI
+    │                            ▼
+    │                     sing-box: tun in → socks out
+    │                       · TCP only; UDP and QUIC → block
+    │                       · DNS → DoT over TCP, through the tunnel
+    │                       · auto_route off — netifd owns routing
+    │                            │
+    │                            ▼
+    │                     olcrtc cnc   SOCKS5 127.0.0.1:8808  (CONNECT only)
+    │                            │
+    │                            ▼
+    │                     WebRTC datachannel / VP8 → SFU (Jitsi, Telemost, WB Stream)
+    │                            │
+    │                            ▼
+    │                     olcrtc srv (your VPS) ──▶ internet
     │
-    ▼
-olcrtc cnc          SOCKS5 on 127.0.0.1:8808  (CONNECT only)
-    │
-    ▼
-WebRTC datachannel / VP8 track → SFU (Jitsi, Telemost, WB Stream)
-    │
-    ▼
-olcrtc srv (your VPS) ──▶ internet
+    └──▶ olcrtc's own SFU traffic bypasses olcrtc0 via `ip rule uidrange` (see below)
 ```
 
-**Why `REDIRECT` + redsocks rather than `tproxy` + sing-box.** REDIRECT is DNAT to a local
-port; the original destination is recovered via `SO_ORIGINAL_DST`. It works for TCP only —
-which is all we have — and avoids `kmod-nft-tproxy`, a policy routing rule and a `local` route
-in a separate table. redsocks is a small C daemon; sing-box is a Go binary of roughly the same
-size as olcRTC itself, which would double the flash footprint to buy UDP support the tunnel
-cannot use anyway.
+**Why a TUN interface rather than transparent redirection.** Revision 1 proposed nftables
+`REDIRECT` into `redsocks`, chosen to keep the flash footprint small. That approach cannot
+satisfy the LuCI requirement: there is no device for netifd to manage, so nothing appears under
+Network → Interfaces and there is nothing to start or stop. A TUN device is what makes the
+interface real — and with roughly 1.8 GB of free overlay on the target, the footprint argument
+that motivated redsocks no longer applies.
 
-Phase 0 verifies redsocks is present in the target feed for each architecture. If it is not,
-the fallback is sing-box with a `tproxy` inbound and a `socks` outbound, at a cost of roughly
-20 MB.
+**Why sing-box.** It creates the TUN, bridges it to olcRTC's SOCKS5, and — critically —
+expresses the three exclusions declaratively in one config: block UDP, block QUIC, and resolve
+DNS over TCP through the proxy. tun2socks is lighter but has no DNS handling and would attempt
+UDP over SOCKS5, which olcRTC rejects. Since sing-box is already packaged for OpenWrt, it does
+the whole job; Phase 0 confirms availability per architecture, with tun2socks plus a separate
+DNS resolver as the fallback.
+
+`auto_route` and `strict_route` are deliberately **off**. sing-box would otherwise install its
+own routes and fight netifd — and netifd owning routing is precisely what makes LuCI's
+Start/Stop behave correctly.
 
 ### Preventing the routing loop
 
-olcRTC's own signalling and WebRTC media must reach the SFU *outside* the tunnel. If its
-traffic is redirected into its own SOCKS5 listener the tunnel deadlocks on startup.
+With a default route via `olcrtc0`, olcRTC's own signalling and WebRTC media would be routed
+into the tunnel it is trying to establish, deadlocking on start.
 
-SFU addresses are dynamic, so an IP allowlist will not hold. Instead the daemon runs as a
-dedicated system user and nftables exempts that user's traffic:
+SFU addresses are dynamic and change on failover, so an IP allowlist will not hold. The daemon
+instead runs as a dedicated system user, and a routing rule keyed on that user forces its
+traffic to the main table:
 
-```
-chain output {
-    type nat hook output priority -100;
-    meta skuid $olcrtc_uid return       # olcrtc's own traffic never redirected
-    ...
-}
+```sh
+ip rule add uidrange ${olcrtc_uid}-${olcrtc_uid} lookup main pref 100
 ```
 
-This is stable across SFU changes, provider switches and failover profiles, and it is the same
-class of fix `qwdtt-openwrt` implements with `iif br-lan` policy routing — but keyed on process
-identity rather than interface, so it also protects traffic the router itself originates.
+Stable across SFU changes, provider switches and failover profiles. It is the same class of fix
+`qwdtt-openwrt` implements with `iif br-lan` policy routing, but keyed on process identity, so
+it also protects traffic the router itself originates.
+
+---
+
+## LuCI integration
+
+This is the part that carries the most new work, and it is standard OpenWrt plumbing rather
+than anything custom.
+
+**1. netifd protocol handler** — `/lib/netifd/proto/olcrtc.sh`
+
+Registers `proto olcrtc` with netifd. On `proto_setup` it renders olcRTC's YAML from UCI,
+starts the daemon and sing-box, waits for `olcrtc0` to appear, then hands the device to netifd:
+
+```sh
+proto_init_update "olcrtc0" 1
+proto_add_ipv4_address "$ipaddr" "$netmask"
+proto_send_update "$interface"
+```
+
+`proto_teardown` stops both cleanly. Because netifd owns the lifecycle, `ifup olcrtc` /
+`ifdown olcrtc` and LuCI's Start / Stop / Restart buttons all work with no extra code, and the
+interface reports genuine up/down state rather than a guess.
+
+**2. Interface definition** — `/etc/config/network`
+
+```
+config interface 'olcrtc'
+    option proto      'olcrtc'
+    option provider   'jitsi'          # jitsi | telemost | wbstream
+    option room       ''               # room URL; must match the server
+    option transport  'datachannel'
+    option key_file   '/etc/olcrtc/olcrtc.key'   # 0600, never inline
+    option socks_port '8808'
+    option block_quic '1'
+    option block_ipv6 '1'
+    option dns_mode   'dot'            # dot | doh | off
+    option auto       '0'              # fail-safe: install ≠ enable
+```
+
+Living in `/etc/config/network` is what places it in the Interfaces tab. The 32-byte key is a
+`0600` file referenced by `key_file` — upstream supports `crypto.key_file` for exactly this —
+so the secret never sits in UCI, never reaches LuCI's form state, and never lands in a config
+backup in cleartext.
+
+**3. LuCI protocol form** — `luci-proto-olcrtc`
+
+A client-side JS module at `/www/luci-static/resources/protocol/olcrtc.js`, matching the modern
+LuCI convention used by `luci-proto-wireguard`:
+
+```js
+'require form'; 'require network';
+return network.registerProtocol('olcrtc', {
+    getI18n:        () => _('olcRTC Tunnel'),
+    getIfname:      () => 'olcrtc0',
+    getOpkgPackage: () => 'olcrtc',
+    isFloating:     () => true,
+    isVirtual:      () => true,
+    renderFormOptions: (s) => { /* provider, room, transport, leak toggles */ }
+});
+```
+
+`isVirtual` tells LuCI not to expect a physical device. The form exposes provider, room,
+transport and the leak-prevention toggles, with the key handled as a file path rather than a
+text field.
+
+**Result:** Network → Interfaces lists **olcrtc** alongside `lan` and `wan`, with live status,
+Start/Stop/Restart, an Edit form, and normal firewall-zone assignment.
 
 ---
 
@@ -102,71 +191,40 @@ identity rather than interface, so it also protects traffic the router itself or
 
 ```
 _olcrtc-openwrt/
-├── UPSTREAM                          # pinned upstream repo + commit + Go version
+├── UPSTREAM                              # pinned repo + commit + Go version
 ├── README.md
-├── docs/
-│   ├── plan.md                       # this file
-│   ├── install.md                    # end-user install
-│   └── troubleshoot.md               # leak checks, log reading
-├── .github/workflows/
-│   ├── build.yml                     # matrix build, runs on every push/PR
-│   └── release.yml                   # tag → apk + ipk + checksums + feed index
+├── docs/{plan.md, install.md, troubleshoot.md}
+├── .github/workflows/{build.yml, release.yml}
 ├── scripts/
-│   ├── build-binary.sh               # cross-compile olcrtc from the pin
-│   ├── mkpkg-apk.sh                  # wrap prebuilt binary as apk
-│   ├── mkpkg-ipk.sh                  # wrap prebuilt binary as ipk
-│   └── leak-check.sh                 # run on-device, asserts no DNS/IPv6/UDP escape
+│   ├── build-binary.sh                   # cross-compile from the pin
+│   ├── mkpkg-apk.sh                      # 25.12
+│   ├── mkpkg-ipk.sh                      # 24.10
+│   └── leak-check.sh                     # on-device: asserts no DNS/IPv6/UDP escape
 └── package/
-    ├── olcrtc/                       # base: binary, procd service, UCI, SOCKS5
+    ├── olcrtc/
     │   ├── Makefile
-    │   └── files/{olcrtc.init, olcrtc.config, olcrtc.uci-defaults}
-    └── olcrtc-tproxy/                # transparent routing: nftables, redsocks, DNS
+    │   └── files/
+    │       ├── olcrtc.proto              # → /lib/netifd/proto/olcrtc.sh
+    │       ├── olcrtc.init               # procd, for socks-only mode
+    │       ├── singbox-tun.json.template
+    │       └── olcrtc.uci-defaults       # creates the interface, does not enable it
+    └── luci-proto-olcrtc/
         ├── Makefile
-        └── files/{olcrtc-tproxy.init, firewall.nft, redsocks.conf.template}
+        └── htdocs/luci-static/resources/protocol/olcrtc.js
 ```
 
-Two packages rather than one, so the routing layer — the part that can take the LAN down — can
-be removed without losing the tunnel. `olcrtc-tproxy` depends on `olcrtc`; installing it pulls
-both.
-
----
-
-## Configuration
-
-UCI is the source of truth. The init script renders olcRTC's YAML from it at every start, so
-users never hand-edit YAML and `/etc/config/olcrtc` survives sysupgrade normally.
-
-```
-config olcrtc 'main'
-    option enabled       '0'          # fail-safe default: install ≠ enable
-    option mode          'tproxy'     # 'tproxy' (whole LAN) | 'socks' (endpoint only)
-    option provider      'jitsi'      # jitsi | telemost | wbstream
-    option room          ''           # room URL, must match the server
-    option transport     'datachannel'
-    option key_file      '/etc/olcrtc/olcrtc.key'   # 0600, not in UCI
-    option socks_port    '8808'
-    option redsocks_port '1088'
-    option lan_zone      'lan'
-    option block_quic    '1'          # reject UDP/443 so browsers fall back to TCP
-    option block_ipv6    '1'          # reject IPv6 forwarding; prevents clear-text leak
-    option dns_mode      'dot'        # 'dot' | 'doh' | 'off'
-
-list bypass_cidr '192.168.0.0/16'     # RFC1918 + multicast bypassed by default
-list bypass_mac  ''                   # devices excluded from the tunnel
-```
-
-The 32-byte key lives in a `0600` file referenced by `key_file`, never inline in UCI — upstream
-supports `crypto.key_file` for exactly this. `enabled '0'` by default means installing the
-package cannot silently reroute someone's network.
+Two packages, following the `wireguard-tools` / `luci-proto-wireguard` convention: the proto
+handler ships with the daemon, the LuCI form is separate so a headless router need not install
+a web UI. `luci-proto-olcrtc` depends on `olcrtc`.
 
 ---
 
 ## Build pipeline
 
-**Source.** Pinned upstream commit, built with the official Go toolchain rather than the
-OpenWrt SDK's — upstream requires Go 1.26.3, which is newer than the SDK ships. The SDK is used
-only to assemble packages around the prebuilt binary, which is the standard binary-package
-pattern and sidesteps the version mismatch entirely.
+**Source.** A pinned upstream commit built with the official Go toolchain, not the OpenWrt
+SDK's — upstream requires Go 1.26.3, newer than the SDK ships. The SDK is used only to assemble
+packages around the prebuilt binary, the standard binary-package pattern, which sidesteps the
+version mismatch entirely.
 
 ```
 # UPSTREAM
@@ -175,149 +233,158 @@ REF=f616f57bb3a90740f1755922ffeaa7acc5cfe4ed   # master @ 2026-08-18
 GO=1.26.3
 ```
 
-Bumping upstream is a one-line edit. A scheduled CI job compares the pin against upstream
-`master` and opens an issue when they diverge, so the pin is deliberate rather than forgotten.
+Bumping upstream is a one-line edit. A scheduled job compares the pin against upstream `master`
+and opens an issue on divergence, so the pin stays deliberate rather than forgotten.
 
-**Matrix.** Confirmed targets:
+**Matrix.**
 
 | OpenWrt arch | GOARCH | Notes |
 |---|---|---|
 | `aarch64_cortex-a53` | `arm64` | Primary target |
 | `aarch64_cortex-a72` | `arm64` | Higher-end ARM platforms |
-| `arm_cortex-a7` | `arm` + `GOARM=7` | 32-bit ARM |
-| `x86_64` | `amd64` | VM/container CI testing without hardware |
+| `arm_cortex-a7` | `arm`, `GOARM=7` | 32-bit ARM |
+| `x86_64` | `amd64` | VM/container testing without hardware |
 
-MIPS is deliberately excluded. Those devices typically ship 8–32 MB of flash and the binary
-will not fit; adding them later is one matrix row plus `GOMIPS=softfloat` if that changes.
+Each builds for both 25.12 (apk) and 24.10 (ipk) — eight artifacts per release.
 
-**Build command** (identical to upstream's own, which already sets these):
+MIPS is excluded: those devices ship 8–32 MB of flash and will not fit the binary. Adding them
+later is one matrix row plus `GOMIPS=softfloat`.
+
+**Build command** (matching upstream's own flags):
 
 ```sh
 CGO_ENABLED=0 GOOS=linux GOARCH=$arch GOARM=$goarm \
   go build -trimpath -ldflags "-s -w" -o olcrtc ./cmd/olcrtc
 ```
 
-**Gates.** `build.yml` runs on every push and PR: `go vet`, upstream's own test suite at the
-pinned commit, a shellcheck pass over the init scripts, and a package-lint step asserting the
-procd script declares `START`/`STOP` and the Makefile declares its dependencies. A build that
-produces a binary but fails a gate does not publish.
+**Gates.** `build.yml` runs on every push and PR: `go vet`, upstream's test suite at the pinned
+commit, `shellcheck` over the proto handler and init scripts, and a package lint asserting the
+proto handler defines `proto_olcrtc_init_config` / `_setup` / `_teardown` and calls
+`add_protocol`. A missing teardown is exactly the bug that leaves a dead interface stuck "up"
+in LuCI, so it is worth failing the build over.
 
-**Release.** Tag `v*` → build all four architectures → emit apk and ipk per arch → generate
-`SHA256SUMS` → sign → publish a GitHub Release and a static apk/opkg feed index so installation
-is `apk add olcrtc-tproxy` after adding one feed line. Unsigned artifacts are not published;
-several projects in this survey ship binaries with no integrity story at all, and that is worth
-not repeating.
+**Release.** Tag `v*` → build all architectures → emit apk and ipk → `SHA256SUMS` → sign →
+publish a GitHub Release plus static apk and opkg feed indexes, so installation is one feed line
+and `apk add luci-proto-olcrtc`. Unsigned artifacts are not published; several projects in this
+survey ship binaries with no integrity story at all, and that is worth not repeating.
 
 ---
 
 ## Phases
 
-Each phase is independently verifiable. Phase 0 exists because it can kill the approach, and
-should run before anything else is written.
+### Phase 0 — Feasibility
 
-### Phase 0 — Feasibility (do this first)
+No longer gated on binary size. With ~1.8 GB free overlay the footprint is irrelevant, so this
+phase now targets the assumptions that can still invalidate the design:
 
-1. **Measure the binary.** Cross-compile for `arm64` and record the stripped size. olcRTC pulls
-   pion/webrtc, livekit protocol, kcp-go and smux; my estimate is **18–25 MB stripped, 8–12 MB
-   compressed in the package**, but this is an estimate — I could not build locally, as there
-   is no Go toolchain on this machine. If it lands far above that, options are UPX (roughly
-   halves it, complicates debugging), trimming unused transports, or requiring extroot.
-2. **Measure RAM** under a sustained transfer. pion plus Go's GC on a router is the other
-   plausible blocker.
-3. **Confirm `redsocks`** exists in the target release feed for each architecture; if not,
-   switch to sing-box and revise the flash budget.
-4. **Confirm a room reaches the SFU from the router's network** at all, before building
-   packaging around it.
-
-**Go/no-go:** if the binary exceeds free overlay space on a mainstream router, the package
-becomes extroot-only and that changes the install story materially.
+1. **Confirm `sing-box` is in the 25.12 and 24.10 feeds** for each architecture, and that its
+   TUN inbound works with `auto_route: false`. Fallback is tun2socks plus a separate resolver.
+2. **Confirm package format per release** — that 25.12 is apk and 24.10 is opkg on the actual
+   images, rather than assuming from version numbers.
+3. **Verify `ip rule uidrange`** is supported by the installed iproute2. If not, fall back to an
+   nftables `meta skuid` mark plus a policy route.
+4. **Confirm a room reaches an SFU from the router's network** before building packaging around
+   it.
+5. Measure binary size and idle/loaded RAM for the record, not as a gate.
 
 ### Phase 1 — Build pipeline
-Cross-compile from the pin across the matrix; publish artifacts with checksums. Deliverable: a
-downloadable binary per architecture, reproducible from a clean checkout.
+Cross-compile from the pin across the matrix; publish checksummed artifacts. Deliverable: a
+binary per architecture, reproducible from a clean checkout.
 
-### Phase 2 — Base package (`olcrtc`)
-procd init script with `respawn`, UCI schema, UCI→YAML rendering, dedicated system user,
-`0600` key file, logging to `logd`. Deliverable: `service olcrtc start` yields a working SOCKS5
-listener on loopback, verified with `curl --socks5`.
+### Phase 2 — Base package and daemon
+Package skeleton, UCI→YAML rendering, dedicated system user, `0600` key file, `logd` logging,
+procd service for socks-only operation. Deliverable: a working SOCKS5 listener on loopback,
+verified with `curl --socks5`.
 
-### Phase 3 — Transparent routing (`olcrtc-tproxy`)
-nftables REDIRECT for LAN TCP, redsocks bridging to SOCKS5, `meta skuid` loop-prevention
-bypass, RFC1918 and multicast bypass sets, per-MAC exclusions, and a firewall zone integrated
-via `/etc/config/firewall` rather than raw rules that sysupgrade will lose. Deliverable: an
-unconfigured LAN device reaches the internet through the tunnel.
+### Phase 3 — netifd protocol handler
+`/lib/netifd/proto/olcrtc.sh`, sing-box TUN config generation, `proto_send_update`, the
+`uidrange` loop-prevention rule, and clean teardown. Deliverable: `ifup olcrtc` brings up
+`olcrtc0` and routes traffic; `ifdown olcrtc` removes it with no residue.
 
-### Phase 4 — Leak prevention (the part that must not be skipped)
-- **DNS:** run a TCP-based resolver — DoT via `stubby` (TCP/853) or DoH via `https-dns-proxy`
-  (TCP/443) — and point dnsmasq at it on loopback. Its TCP traffic is redirected like any
-  other, so resolution happens through the tunnel. `dns_mode 'off'` is available for users who
-  accept plaintext DNS, but it is not the default.
-- **QUIC:** reject forwarded UDP/443 so browsers fall back to TCP, rather than silently
-  bypassing the tunnel.
-- **IPv6:** reject IPv6 forwarding while the tunnel is up. Optionally stop advertising IPv6 on
-  the LAN so clients never acquire an address they cannot use.
-- **Kill-switch:** if olcRTC dies, LAN forwarding fails closed rather than falling back to the
-  clear WAN path. procd restarts it; the firewall does not open in the gap.
+### Phase 4 — Leak prevention (must not be skipped)
+- **DNS:** sing-box's DNS server forwards over DoT (TCP/853) through the proxy outbound;
+  dnsmasq points at it on loopback. `dns_mode 'off'` exists for users who accept plaintext DNS,
+  but is not the default.
+- **QUIC:** a route rule sends `protocol: quic` to `block`, so browsers fall back to TCP rather
+  than silently bypassing the tunnel.
+- **IPv6:** no IPv6 address or route on `olcrtc0`, and IPv6 forwarding rejected while the
+  interface is up. Optionally stop advertising IPv6 on the LAN so clients never acquire an
+  address they cannot use.
+- **Kill-switch:** if olcRTC dies, traffic fails closed rather than falling back to the clear
+  WAN path. netifd marks the interface down and the firewall does not open in the gap.
 - `scripts/leak-check.sh` asserts all four from the router and exits non-zero on any leak.
 
-### Phase 5 — Distribution
-apk and ipk from one build, a signed static feed, and `docs/install.md`. Deliverable:
-`apk add olcrtc-tproxy` on a clean router.
+### Phase 5 — LuCI package
+`luci-proto-olcrtc`, the protocol form, status rendering and translation stubs. Deliverable:
+the interface is fully configurable from the browser without touching a shell.
 
-### Phase 6 — On-device validation
-Install on real hardware, run `leak-check.sh`, measure throughput and memory over a sustained
-transfer, verify recovery across WAN loss, reboot and sysupgrade.
+### Phase 6 — Validation
+Install on real hardware for both releases. Run `leak-check.sh`; measure throughput and memory
+over a sustained transfer; verify recovery across WAN loss, reboot and sysupgrade; confirm
+Start/Stop/Restart behave correctly from LuCI, including repeated cycling.
+
+Per your answer, **CI does not deploy to a device** — this phase is manual, and no address or
+identifying detail appears anywhere in the repository.
 
 ---
 
 ## Risks
 
-**Flash footprint** is the main technical risk and Phase 0 quantifies it. A 20 MB Go binary is
-large for a router even before redsocks and a DNS resolver.
-
 **Throughput will be modest.** Traffic is TCP inside a WebRTC datachannel inside DTLS/SCTP,
-reassembled by a Go userspace process on a router CPU. Treat this as a browsing and
+reassembled by a Go userspace process, now with a TUN hop on top. Treat it as a browsing and
 whitelist-bypass path, not a bulk-transfer link, and measure before promising numbers.
 
 **TCP-in-TCP meltdown.** Carrying TCP over a reliable datachannel stacks two congestion
-controllers; under loss this degrades sharply. olcRTC's KCP transports exist partly to address
-this, so Phase 6 should compare `datachannel` against KCP-backed profiles rather than assuming
-the default is best.
+controllers; under loss this degrades sharply. olcRTC's KCP-backed transports exist partly to
+address this, so Phase 6 should compare `datachannel` against them rather than assuming the
+default is best.
+
+**Two moving dependencies, not one.** The design now rests on sing-box as well as olcRTC. A
+sing-box config-schema change between OpenWrt releases would break the generated config, so the
+template is validated in CI against the version each release ships.
 
 **Upstream is a moving target.** olcRTC has one tag, no releases, a five-month history, 78% of
 commits from one author, and four dependencies in maintainer-personal namespaces that have been
-re-tagged in place. Pinning a commit is what makes this buildable at all; expect the pin to
-need real testing on each bump rather than a rubber stamp.
+re-tagged in place. Pinning is what makes this buildable; expect each bump to need real testing
+rather than a rubber stamp.
 
-**Sudden obsolescence.** The whole technique depends on a third party that has not agreed to be
+**Sudden obsolescence.** The technique depends on a third party that has not agreed to be
 depended upon. Any provider-side change can close it without warning, as happened to
-`jaykaiperson/lionheart`. Nothing in this plan mitigates that; it is the cost of the category.
+`jaykaiperson/lionheart`. Nothing here mitigates that; it is the cost of the category.
 
-**Account risk.** Provider-backed profiles may associate the tunnel with a real account.
-Default the documentation to Jitsi, which needs no account at all.
+**Account risk.** Provider-backed profiles may tie the tunnel to a real account. Documentation
+defaults to Jitsi, which needs no account at all.
 
 ---
 
-## Open questions
+## What changed in revision 2
 
-1. **Target OpenWrt release for the primary device** — 24.10, 25.12 or a vendor fork? It
-   decides whether apk or ipk is the tested-first path. I have assumed apk-first with ipk built
-   alongside.
-2. **Free overlay space** on the primary device, which Phase 0 checks against the measured
-   binary.
-3. **Should CI deploy to a device for smoke testing?** Feasible via a self-hosted runner or an
-   SSH deploy step. It would need a host and credentials held as secrets, and per your
-   instruction no address or identifying detail would appear in the repository. Default
-   assumption: **no** — Phase 6 stays manual.
-4. **Server side.** This plan covers the router client only and assumes an `olcrtc srv` already
-   running on a VPS with a matching room and key. Say if provisioning that should also be in
-   scope.
+| | Revision 1 | Revision 2 |
+|---|---|---|
+| Data path | nftables `REDIRECT` → redsocks | TUN device → sing-box |
+| Why | Smallest possible footprint | Only a real device can appear in LuCI Interfaces |
+| Packages | `olcrtc` + `olcrtc-tproxy` | `olcrtc` (incl. proto handler) + `luci-proto-olcrtc` |
+| Loop prevention | nftables `meta skuid` | `ip rule uidrange` |
+| Releases | apk "24.10+", ipk older | 25.12 apk primary, 24.10 ipk alongside |
+| Phase 0 gate | Binary size — go/no-go | Size irrelevant; now sing-box availability |
+| Dropped risks | Flash footprint, extroot, UPX | — |
+
+---
+
+## Remaining open question
+
+**Server-side scope.** This plan covers the router client only, and assumes an `olcrtc srv`
+already running on a VPS with a matching room and key. Say if provisioning that should also be
+in scope — it would add a phase, and the natural shape is a deploy script rather than a package.
+
+Everything else is settled: 25.12 primary with 24.10 alongside, storage is ample, and CI does
+not touch a device.
 
 ---
 
 ## Confirm before I start
 
-The concrete asks: approve the architecture (REDIRECT + redsocks over tproxy + sing-box), the
-two-package split, the fail-closed defaults in Phase 4, and answer the four open questions
-above. Phase 0 runs first regardless, since its result can change the shape of everything after
-it.
+Approve the switch to a TUN-based data path with sing-box (the change that makes LuCI
+integration possible), the two-package split, and the fail-closed defaults in Phase 4 — then
+answer the server-side question above. Phase 0 runs first regardless, since sing-box
+availability can still change the shape of Phase 3.
