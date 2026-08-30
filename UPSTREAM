@@ -1,0 +1,19 @@
+# Pinned upstream source for the olcRTC binary.
+#
+# Bumping this file is the only supported way to move to a newer olcRTC.
+# Do not track a branch: upstream has one tag, no releases, and four
+# dependencies in maintainer-personal namespaces that have been re-tagged in
+# place. A pinned commit is what makes this buildable reproducibly.
+#
+# After changing REF, run the full Phase 6 validation. Upstream has no release
+# discipline, so a bump is not a rubber stamp.
+
+REPO=https://github.com/openlibrecommunity/olcrtc
+REF=f616f57bb3a90740f1755922ffeaa7acc5cfe4ed
+REF_DATE=2026-08-18
+REF_BRANCH=master
+
+# Go toolchain used to build the pin. Upstream go.mod requires 1.26.3, which is
+# newer than the OpenWrt SDK ships -- this is why we build with the official
+# toolchain and use the SDK only to assemble packages around the result.
+GO=1.26.3
