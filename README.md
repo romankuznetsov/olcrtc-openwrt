@@ -28,7 +28,7 @@ LAN device (no configuration)
 br-lan ──▶ olcrtc0            real TUN device, managed by netifd, controlled from LuCI
                │
                ▼
-        sing-box              tun in → socks out; TCP only, UDP/QUIC blocked, DNS over TCP
+  hev-socks5-tunnel           ~270 KB C daemon: TUN → SOCKS5
                │
                ▼
         olcrtc cnc            SOCKS5 on loopback (CONNECT only)
@@ -43,8 +43,8 @@ in upstream source, not inferred.
 
 That means UDP, QUIC and IPv6 cannot traverse the tunnel. Left alone they do not merely fail —
 they leak, exiting the WAN in the clear while the tunnel looks up. So the package **rejects them
-by default**: DNS is forced over TCP, QUIC is blocked so browsers fall back, and IPv6 forwarding
-is refused while the interface is up. Some traffic visibly fails instead of silently escaping.
+by default**: nftables rejects UDP, QUIC and IPv6 forwarding while the interface is up, and DNS
+is forced over TCP via `https-dns-proxy`. Some traffic visibly fails instead of silently escaping.
 That is the intended trade.
 
 ---

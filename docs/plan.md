@@ -2,9 +2,12 @@
 
 **Status: awaiting confirmation.** Nothing has been built yet. This document is the proposal.
 
-**Revision 2** — reworked after confirmation that the tunnel must appear as a managed interface
-in LuCI, and that the target device has ample storage. Both changed the architecture; see
-[What changed in revision 2](#what-changed-in-revision-2). VPS server provisioning is now in
+**Revision 3** — the TUN→SOCKS5 bridge is `hev-socks5-tunnel`, not sing-box. Requested on
+weight; it turned out to also remove the config-schema problem sing-box would have introduced.
+See [Revision history](#revision-history).
+
+Revision 2 reworked the design after confirmation that the tunnel must appear as a managed
+interface in LuCI and that the target device has ample storage. VPS server provisioning is in
 scope as [Phase S](#phase-s--vps-server).
 
 ## What this is
@@ -70,10 +73,7 @@ LAN device (no configuration)
 br-lan ──▶ routing table ──▶ olcrtc0        ← real TUN device, managed by netifd,
     │                            │             visible and controllable in LuCI
     │                            ▼
-    │                     sing-box: tun in → socks out
-    │                       · TCP only; UDP and QUIC → block
-    │                       · DNS → DoT over TCP, through the tunnel
-    │                       · auto_route off — netifd owns routing
+    │                     hev-socks5-tunnel        ~270 KB, C, TUN → SOCKS5
     │                            │
     │                            ▼
     │                     olcrtc cnc   SOCKS5 127.0.0.1:8808  (CONNECT only)
@@ -84,6 +84,8 @@ br-lan ──▶ routing table ──▶ olcrtc0        ← real TUN device, man
     │                            ▼
     │                     olcrtc srv (your VPS) ──▶ internet
     │
+    ├──▶ nftables: UDP and QUIC rejected, IPv6 forwarding rejected   (Phase 4)
+    ├──▶ https-dns-proxy: DNS over TCP/443, routed through the tunnel
     └──▶ olcrtc's own SFU traffic bypasses olcrtc0 via `ip rule uidrange` (see below)
 ```
 
@@ -91,19 +93,34 @@ br-lan ──▶ routing table ──▶ olcrtc0        ← real TUN device, man
 `REDIRECT` into `redsocks`, chosen to keep the flash footprint small. That approach cannot
 satisfy the LuCI requirement: there is no device for netifd to manage, so nothing appears under
 Network → Interfaces and there is nothing to start or stop. A TUN device is what makes the
-interface real — and with roughly 1.8 GB of free overlay on the target, the footprint argument
-that motivated redsocks no longer applies.
+interface real.
 
-**Why sing-box.** It creates the TUN, bridges it to olcRTC's SOCKS5, and — critically —
-expresses the three exclusions declaratively in one config: block UDP, block QUIC, and resolve
-DNS over TCP through the proxy. tun2socks is lighter but has no DNS handling and would attempt
-UDP over SOCKS5, which olcRTC rejects. Since sing-box is already packaged for OpenWrt, it does
-the whole job; Phase 0 confirms availability per architecture, with tun2socks plus a separate
-DNS resolver as the fallback.
+**Why `hev-socks5-tunnel` rather than sing-box or tun2socks.** `tun2socks` is not packaged for
+OpenWrt at all — not under that name, nor as `badvpn-tun2socks`. The OpenWrt equivalent is
+`hev-socks5-tunnel`: a small C daemon doing exactly tun2socks' job, creating a TUN device and
+forwarding it to a SOCKS5 upstream. At 210–270 KB it is roughly **70× smaller than sing-box**.
 
-`auto_route` and `strict_route` are deliberately **off**. sing-box would otherwise install its
-own routes and fight netifd — and netifd owning routing is precisely what makes LuCI's
-Start/Stop behave correctly.
+The size was the motivation, but the better outcome is a simpler design. Both OpenWrt releases
+ship the *same* version, 2.17.0 — whereas sing-box ships 1.12 on 24.10 and 1.13 on 25.12, which
+do not share a config schema and would have forced two templates plus a runtime version probe.
+That machinery is now unnecessary.
+
+The trade is that `hev-socks5-tunnel` does one job and nothing else, so two responsibilities
+sing-box would have absorbed become explicit:
+
+| Job | sing-box would have | Now |
+|---|---|---|
+| Block UDP and QUIC | route rules in its config | nftables on the router |
+| DNS over TCP | built-in DNS server | `https-dns-proxy` (DoH/443), or `stubby` (DoT/853) |
+
+Neither is extra work in practice. Phase 4 needed nftables rules regardless for the fail-closed
+guarantees, so this removes a duplicate mechanism rather than adding one; and DNS becomes a
+declared package dependency, visible in the manifest, instead of a config block buried in JSON.
+
+**UDP dies either way, which is the behaviour we want.** `hev-socks5-tunnel` can relay UDP only
+via SOCKS5 `UDP ASSOCIATE` or a hev-specific UDP-in-TCP extension. olcRTC supports neither, so
+UDP cannot traverse regardless of configuration. The nftables rules exist to make it fail
+*fast and visibly* rather than hang until timeout.
 
 ### Preventing the routing loop
 
@@ -132,7 +149,8 @@ than anything custom.
 **1. netifd protocol handler** — `/lib/netifd/proto/olcrtc.sh`
 
 Registers `proto olcrtc` with netifd. On `proto_setup` it renders olcRTC's YAML from UCI,
-starts the daemon and sing-box, waits for `olcrtc0` to appear, then hands the device to netifd:
+starts the daemon and `hev-socks5-tunnel`, waits for `olcrtc0` to appear, then hands the device
+to netifd:
 
 ```sh
 proto_init_update "olcrtc0" 1
@@ -210,7 +228,7 @@ _olcrtc-openwrt/
     │   └── files/
     │       ├── olcrtc.proto              # → /lib/netifd/proto/olcrtc.sh
     │       ├── olcrtc.init               # procd, for socks-only mode
-    │       ├── singbox-tun.json.template
+    │       ├── hev-tunnel.yaml.template
     │       └── olcrtc.uci-defaults       # creates the interface, does not enable it
     └── luci-proto-olcrtc/
         ├── Makefile
@@ -281,8 +299,9 @@ survey ship binaries with no integrity story at all, and that is worth not repea
 No longer gated on binary size. With ~1.8 GB free overlay the footprint is irrelevant, so this
 phase now targets the assumptions that can still invalidate the design:
 
-1. **Confirm `sing-box` is in the 25.12 and 24.10 feeds** for each architecture, and that its
-   TUN inbound works with `auto_route: false`. Fallback is tun2socks plus a separate resolver.
+1. **Confirm a TUN→SOCKS5 bridge exists in the 25.12 and 24.10 feeds** for each architecture.
+   *(Done — `hev-socks5-tunnel` 2.17.0 on all four, both releases. `tun2socks` is not packaged
+   for OpenWrt at all. See [phase0-results.md](phase0-results.md).)*
 2. **Confirm package format per release** — that 25.12 is apk and 24.10 is opkg on the actual
    images, rather than assuming from version numbers.
 3. **Verify `ip rule uidrange`** is supported by the installed iproute2. If not, fall back to an
@@ -372,14 +391,16 @@ procd service for socks-only operation. Deliverable: a working SOCKS5 listener o
 verified with `curl --socks5`.
 
 ### Phase 3 — netifd protocol handler
-`/lib/netifd/proto/olcrtc.sh`, sing-box TUN config generation, `proto_send_update`, the
+`/lib/netifd/proto/olcrtc.sh`, `hev-socks5-tunnel` config generation, `proto_send_update`, the
 `uidrange` loop-prevention rule, and clean teardown. Deliverable: `ifup olcrtc` brings up
 `olcrtc0` and routes traffic; `ifdown olcrtc` removes it with no residue.
 
 ### Phase 4 — Leak prevention (must not be skipped)
-- **DNS:** sing-box's DNS server forwards over DoT (TCP/853) through the proxy outbound;
-  dnsmasq points at it on loopback. `dns_mode 'off'` exists for users who accept plaintext DNS,
-  but is not the default.
+- **DNS:** `https-dns-proxy` resolves over DoH (TCP/443) and dnsmasq points at it on loopback,
+  so lookups ride the tunnel like any other TCP. DoH is preferred over `stubby`'s DoT because
+  TCP/443 is indistinguishable from ordinary HTTPS, whereas TCP/853 is a distinctive port.
+  `dns_mode 'dot'` selects stubby; `dns_mode 'off'` accepts plaintext DNS and is not the
+  default.
 - **QUIC:** a route rule sends `protocol: quic` to `block`, so browsers fall back to TCP rather
   than silently bypassing the tunnel.
 - **IPv6:** no IPv6 address or route on `olcrtc0`, and IPv6 forwarding rejected while the
@@ -414,9 +435,11 @@ controllers; under loss this degrades sharply. olcRTC's KCP-backed transports ex
 address this, so Phase 6 should compare `datachannel` against them rather than assuming the
 default is best.
 
-**Two moving dependencies, not one.** The design now rests on sing-box as well as olcRTC. A
-sing-box config-schema change between OpenWrt releases would break the generated config, so the
-template is validated in CI against the version each release ships.
+**Three runtime dependencies, all small and all stable.** `hev-socks5-tunnel`,
+`https-dns-proxy` and dnsmasq sit alongside olcRTC. The schema-drift risk that motivated this
+concern is largely gone: both OpenWrt releases ship the same `hev-socks5-tunnel` 2.17.0, so one
+config template covers both. CI still validates the rendered config, but there is no version
+matrix to maintain.
 
 **Upstream is a moving target.** olcRTC has one tag, no releases, a five-month history, 78% of
 commits from one author, and four dependencies in maintainer-personal namespaces that have been
@@ -432,17 +455,26 @@ defaults to Jitsi, which needs no account at all.
 
 ---
 
-## What changed in revision 2
+## Revision history
 
-| | Revision 1 | Revision 2 |
-|---|---|---|
-| Data path | nftables `REDIRECT` → redsocks | TUN device → sing-box |
-| Why | Smallest possible footprint | Only a real device can appear in LuCI Interfaces |
-| Packages | `olcrtc` + `olcrtc-tproxy` | `olcrtc` (incl. proto handler) + `luci-proto-olcrtc` |
-| Loop prevention | nftables `meta skuid` | `ip rule uidrange` |
-| Releases | apk "24.10+", ipk older | 25.12 apk primary, 24.10 ipk alongside |
-| Phase 0 gate | Binary size — go/no-go | Size irrelevant; now sing-box availability |
-| Dropped risks | Flash footprint, extroot, UPX | — |
+| | Rev 1 | Rev 2 | Rev 3 (current) |
+|---|---|---|---|
+| Data path | nftables `REDIRECT` → redsocks | TUN → sing-box | TUN → `hev-socks5-tunnel` |
+| Bridge size | ~100 KB | ~20 MB | ~270 KB |
+| Why | Smallest footprint | Only a real device appears in LuCI | Weight, without losing the interface |
+| UDP/QUIC block | nftables | sing-box route rules | nftables |
+| DNS over TCP | stubby / https-dns-proxy | sing-box built-in | `https-dns-proxy` (DoH/443) |
+| Config templates | n/a | two — 1.12 and 1.13 schemas differ | **one** — 2.17.0 on both releases |
+| Packages | `olcrtc` + `olcrtc-tproxy` | `olcrtc` + `luci-proto-olcrtc` | unchanged from rev 2 |
+| Loop prevention | nftables `meta skuid` | `ip rule uidrange` | unchanged from rev 2 |
+
+**Revision 3 is a net simplification, not just a smaller binary.** sing-box ships 1.12 on
+OpenWrt 24.10 and 1.13 on 25.12, and those releases do not share a config schema — sniffing
+moved from an inbound flag to a route-rule action, TUN address fields were renamed, the DNS
+block was restructured. Supporting both meant two templates, a runtime version probe, and a CI
+matrix validating each schema. `hev-socks5-tunnel` is 2.17.0 on *both* releases, so all of that
+disappears. The responsibilities sing-box would have absorbed move to nftables, which Phase 4
+needed anyway, and to a declared package dependency for DNS.
 
 ---
 
@@ -468,10 +500,10 @@ Nothing is outstanding. Every question this plan raised has an answer:
 ## Confirm before I start
 
 One decision needs your approval, because it reverses a choice from revision 1: **the data path
-becomes a TUN interface driven by sing-box, instead of nftables redirection into redsocks.**
-That switch is what makes the LuCI Interfaces requirement achievable at all, and the storage
-headroom is what makes it affordable. Approving it also means accepting sing-box as a second
-runtime dependency alongside olcRTC.
+becomes a TUN interface driven by `hev-socks5-tunnel`, instead of nftables redirection into
+redsocks.** That switch is what makes the LuCI Interfaces requirement achievable at all.
+Approving it also means accepting three small runtime dependencies alongside olcRTC:
+`hev-socks5-tunnel` (~270 KB), `https-dns-proxy`, and dnsmasq, which is already present.
 
 Alongside that, please confirm the two-package split (`olcrtc` + `luci-proto-olcrtc`) and the
 fail-closed defaults in Phase 4 — the DNS, QUIC and IPv6 rejections. Those defaults will make
@@ -479,5 +511,5 @@ some traffic visibly fail rather than silently leak, which is the correct trade 
 circumvention tool but is worth agreeing to deliberately rather than discovering later.
 
 On approval I start with **Phase 0** and **Phase S** together, since they are independent:
-Phase 0 answers whether sing-box is available for each target, and Phase S gives you a working
-server to test against. Neither writes anything to your hosts without you reading it first.
+Phase 0 is already done — see [phase0-results.md](phase0-results.md) — and Phase S gives you a
+working server to test against. Neither writes anything to your hosts without you reading it first.

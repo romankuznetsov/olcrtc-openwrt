@@ -21,37 +21,61 @@ numbers:
 Latest points on each line are 24.10.8 and 25.12.5. The apk migration landed between them, so
 25.12 takes apk and 24.10 takes ipk — exactly the split the build pipeline already targets.
 
-## 2. sing-box availability — CONFIRMED, with a caveat
+## 2. TUN→SOCKS5 bridge — CONFIRMED as `hev-socks5-tunnel`
 
-Present on every target architecture in both releases, so the TUN data path is viable
-everywhere and the tun2socks fallback is not needed:
+**`tun2socks` is not in the OpenWrt feeds at all** — not under that name, and not as
+`badvpn-tun2socks`. Searched `packages`, `luci`, `routing` and `telephony` for 24.10.8: zero
+hits. The OpenWrt equivalent is the `hev-socks5-*` family, and the one we want is
+`hev-socks5-tunnel`: a small C daemon that creates a TUN device and forwards it to a SOCKS5
+upstream, which is exactly tun2socks' job.
 
-| Architecture | 24.10.8 (ipk) | 25.12.5 (apk) |
+Available on every target architecture in both releases:
+
+| Architecture | 24.10.8 (ipk) | 25.12.5 (apk) | Installed size |
+|---|---|---|---|
+| `aarch64_cortex-a53` | 2.17.0-r1 | 2.17.0-r2 | 270 KB |
+| `aarch64_cortex-a72` | 2.17.0-r1 | 2.17.0-r2 | 270 KB |
+| `arm_cortex-a7` | 2.17.0-r1 | 2.17.0-r2 | 210 KB |
+| `x86_64` | 2.17.0-r1 | 2.17.0-r2 | 250 KB |
+
+**Two things fall out of this, and the second is the more valuable.**
+
+*Size.* At 210–270 KB it is roughly **70× smaller than sing-box**, which was the reason for the
+change. Total runtime footprint becomes the olcRTC binary plus a quarter-megabyte, rather than
+the olcRTC binary plus a second Go binary of comparable size.
+
+*The version-skew problem disappears.* Both releases ship **2.17.0** — the same upstream
+version, differing only in OpenWrt package revision. The sing-box plan needed two config
+templates and a runtime version probe because 1.12 and 1.13 do not share a schema. That is now
+one template, no probe, and no CI matrix to validate two schemas. This is a real simplification,
+not just a smaller binary.
+
+**What sing-box was also doing, and where it moves:**
+
+| Job | Was | Now |
 |---|---|---|
-| `aarch64_cortex-a53` | 1.12.22-r1 | 1.13.18-r1 |
-| `aarch64_cortex-a72` | 1.12.22-r1 | 1.13.18-r1 |
-| `arm_cortex-a7` | 1.12.22-r1 | 1.13.18-r1 |
-| `x86_64` | 1.12.22-r1 | 1.13.18-r1 |
+| TUN device + SOCKS5 bridge | sing-box `tun` in / `socks` out | `hev-socks5-tunnel` |
+| Block UDP and QUIC | sing-box route rules | nftables on the router |
+| DNS over TCP | sing-box built-in DNS | `https-dns-proxy` (DoH) or `stubby` (DoT) |
 
-**The caveat is the version gap, and it is the concrete form of a risk the plan flagged in the
-abstract.** The two releases ship sing-box minor versions that do not share one config schema.
-Between 1.12 and 1.13 the areas we depend on most are exactly the ones that moved: protocol
-sniffing migrated from an inbound flag to a route rule action, TUN address fields were
-renamed, and the DNS block was restructured. A single hand-written config will not validate on
-both.
+The nftables rules were already required for the Phase 4 fail-closed guarantees, so moving UDP
+and QUIC blocking there removes a duplicate mechanism rather than adding work. DNS becomes an
+explicit dependency instead of a config block — arguably clearer, since it is now visible in the
+package manifest.
 
-**Decision:** the init script detects the installed sing-box version and renders a matching
-template, rather than shipping one config and hoping. Concretely:
+## 2b. DNS resolvers — CONFIRMED
 
-- `files/singbox-1.12.json.template` for 24.10
-- `files/singbox-1.13.json.template` for 25.12
-- version detected via `sing-box version` at interface bring-up
-- both templates validated with `sing-box check` in CI against both versions, so a schema drift
-  fails the build instead of failing on someone's router
+Both TCP-based options are present on all four architectures in both releases, so DNS can be
+forced through the tunnel:
 
-This costs one extra template and one CI job. The alternative — targeting the oldest schema and
-relying on deprecation shims — breaks the moment a shim is removed, which is what the 1.12→1.13
-changes demonstrate.
+| Package | 24.10.8 | 25.12.5 | Transport |
+|---|---|---|---|
+| `https-dns-proxy` | 2026.05.06-r1 | 2026.05.06-r1 | DoH over TCP/443 |
+| `stubby` | 0.4.3-r1 | 0.4.3-r3 | DoT over TCP/853 |
+
+`https-dns-proxy` is the default: it has a LuCI companion app, and DoH on TCP/443 is
+indistinguishable from ordinary HTTPS to anything watching the tunnel, whereas DoT's TCP/853 is
+a distinctive port. `stubby` remains selectable via `dns_mode`.
 
 ## 3. `ip rule uidrange` support — NEEDS HARDWARE
 
@@ -75,6 +99,14 @@ taken — my earlier 18–25 MB estimate remains an estimate until CI produces a
 
 ## Outcome
 
-**No blockers.** The TUN plus sing-box architecture stands on all four target architectures and
-both releases. One design change falls out of check 2: per-version sing-box config templates
-rather than a single file. Checks 3 and 4 need the hardware and do not block Phases 1, 2 or S.
+**No blockers.** The TUN data path stands on all four target architectures and both releases,
+now built on `hev-socks5-tunnel` rather than sing-box.
+
+The switch away from sing-box removed a design problem rather than creating one. It was adopted
+on size grounds — 270 KB against roughly 20 MB — but the larger benefit is that both OpenWrt
+releases ship the *same* `hev-socks5-tunnel` version, so the two config templates and the
+runtime version probe that sing-box's 1.12/1.13 schema split forced are no longer needed. UDP
+and QUIC blocking moves to nftables, where Phase 4 needed rules anyway, and DNS becomes an
+explicit package dependency.
+
+Checks 3 and 4 need the hardware and do not block Phases 1, 2 or S.

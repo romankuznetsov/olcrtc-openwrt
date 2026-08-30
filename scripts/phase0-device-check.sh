@@ -79,8 +79,8 @@ else
     fi
 fi
 
-# ------------------------------------------------------------- TUN + sing-box
-head_ "TUN and sing-box"
+# --------------------------------------------- TUN, SOCKS5 bridge, DNS
+head_ "TUN, SOCKS5 bridge and DNS"
 
 if [ -c /dev/net/tun ]; then
     ok "/dev/net/tun present"
@@ -94,16 +94,32 @@ else
     fi
 fi
 
-if command -v sing-box >/dev/null 2>&1; then
-    SBV=$(sing-box version 2>/dev/null | head -1)
-    ok "sing-box installed: ${SBV:-unknown}"
-    case "$SBV" in
-        *1.12*) ok "  -> will use the 1.12 config template" ;;
-        *1.13*) ok "  -> will use the 1.13 config template" ;;
-        *)      warn "  -> unrecognised version; no config template exists for it yet" ;;
-    esac
+# hev-socks5-tunnel is the TUN -> SOCKS5 bridge. tun2socks is not packaged for
+# OpenWrt at all, under that name or as badvpn-tun2socks.
+if command -v hev-socks5-tunnel >/dev/null 2>&1; then
+    ok "hev-socks5-tunnel installed"
 else
-    warn "sing-box not installed yet (the package depends on it; this is expected pre-install)"
+    warn "hev-socks5-tunnel not installed yet (a package dependency; expected pre-install)"
+fi
+
+# DNS must ride TCP, since the tunnel cannot carry UDP.
+if command -v https-dns-proxy >/dev/null 2>&1; then
+    ok "https-dns-proxy installed (DoH over TCP/443)"
+elif command -v stubby >/dev/null 2>&1; then
+    ok "stubby installed (DoT over TCP/853)"
+else
+    warn "no TCP-capable resolver yet (https-dns-proxy or stubby); a package dependency"
+fi
+
+# Confirm the feed actually offers them for this architecture.
+if command -v apk >/dev/null 2>&1; then
+    apk list hev-socks5-tunnel 2>/dev/null | head -1 | grep -q . \
+        && ok "hev-socks5-tunnel available in the apk feed" \
+        || warn "hev-socks5-tunnel not found in the apk feed -- run 'apk update' first"
+elif command -v opkg >/dev/null 2>&1; then
+    opkg list hev-socks5-tunnel 2>/dev/null | head -1 | grep -q . \
+        && ok "hev-socks5-tunnel available in the opkg feed" \
+        || warn "hev-socks5-tunnel not found in the opkg feed -- run 'opkg update' first"
 fi
 
 # ------------------------------------------------------- check 4: SFU reachability
@@ -136,12 +152,14 @@ AVAIL_KB=$(df -k /overlay 2>/dev/null | awk 'NR==2 {print $4}')
 [ -z "$AVAIL_KB" ] && AVAIL_KB=$(df -k / 2>/dev/null | awk 'NR==2 {print $4}')
 if [ -n "$AVAIL_KB" ]; then
     AVAIL_MB=$((AVAIL_KB / 1024))
-    if [ "$AVAIL_MB" -ge 120 ]; then
-        ok "${AVAIL_MB} MB free -- ample for olcrtc + sing-box"
-    elif [ "$AVAIL_MB" -ge 60 ]; then
-        warn "${AVAIL_MB} MB free -- tight; olcrtc plus sing-box is roughly 40-60 MB"
+    # Footprint is the olcrtc Go binary (~20 MB estimated, confirmed in Phase 1)
+    # plus hev-socks5-tunnel at ~270 KB and a small DNS proxy. Call it ~25 MB.
+    if [ "$AVAIL_MB" -ge 60 ]; then
+        ok "${AVAIL_MB} MB free -- ample (the whole stack is roughly 25 MB)"
+    elif [ "$AVAIL_MB" -ge 35 ]; then
+        warn "${AVAIL_MB} MB free -- workable but leaves little headroom for upgrades"
     else
-        bad "${AVAIL_MB} MB free -- not enough"
+        bad "${AVAIL_MB} MB free -- not enough for the olcrtc binary"
     fi
 else
     warn "could not determine free space"
