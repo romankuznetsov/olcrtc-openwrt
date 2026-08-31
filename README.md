@@ -14,8 +14,10 @@ through it with no client-side setup on any device.
 | Server | Ubuntu 24.04 LTS, x86_64 |
 | Upstream | Pinned commit, built with the official Go toolchain — see [`UPSTREAM`](UPSTREAM) |
 
-> **Status: early.** Phase 0 and Phase S are done. The packages themselves are not built yet.
-> See [docs/plan.md](docs/plan.md) for the full plan and phase order.
+> **Status: unvalidated on hardware.** Phases 0-5 are written — build pipeline, the netifd
+> protocol handler, leak prevention, the LuCI form and VPS provisioning. Nothing has run on a
+> router or through CI yet, so treat the first install as Phase 6 (validation).
+> See [docs/plan.md](docs/plan.md).
 
 ---
 
@@ -53,13 +55,15 @@ That is the intended trade.
 
 ```
 UPSTREAM                          pinned upstream commit + Go version
-docs/
-  plan.md                         full implementation plan and phases
-  phase0-results.md               feasibility findings (verified against OpenWrt feeds)
-  server-setup.md                 VPS walkthrough
+.github/workflows/                build matrix, gates, signed release
+docs/                             plan, Phase 0 findings, VPS walkthrough
 scripts/
+  build-binary.sh                 cross-compile olcRTC from the pin
   phase0-device-check.sh          read-only router checks
   provision-server.sh             VPS provisioning (Ubuntu 24.04)
+package/
+  olcrtc/                         binary, netifd protocol handler, firewall
+  luci-proto-olcrtc/              the Network -> Interfaces form
 ```
 
 ## Getting started

@@ -1,0 +1,21 @@
+# Reference only. The live config is rendered at ifup by
+# /lib/netifd/proto/olcrtc.sh into /var/run/olcrtc/ from the uci interface
+# section. Editing this file has no effect.
+mode: cnc
+auth:
+  provider: jitsi
+room:
+  id: "https://meet.example.org/REPLACE"
+crypto:
+  key_file: "/etc/olcrtc/olcrtc.key"
+net:
+  transport: datachannel
+  dns: "127.0.0.1:5053"
+liveness:
+  interval: 10s
+  timeout: 15s
+  failures: 4
+socks:
+  host: "127.0.0.1"
+  port: 8808
+debug: false

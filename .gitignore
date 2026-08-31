@@ -1,0 +1,11 @@
+# build outputs
+/out/
+/.build/
+*.apk
+*.ipk
+*.sha256
+
+# never commit secrets or rendered configs
+*.key
+olcrtc.yaml
+hev-*.yaml

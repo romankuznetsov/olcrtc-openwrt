@@ -1,0 +1,140 @@
+name: release
+
+# Tag v* -> build every architecture for both releases, publish signed packages
+# and a static feed.
+#
+# Nothing is published unsigned. Several projects in this ecosystem ship
+# binaries with no integrity story at all, and the provisioning script here
+# refuses to install an unverified download -- that guarantee is only worth
+# anything if the release side upholds its half.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+
+  release:
+    name: publish
+    runs-on: ubuntu-24.04
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dl
+
+      - name: collect artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p rel
+          # Packages, grouped by release so the feed indexes stay separate.
+          for d in dl/pkg-*; do
+            [ -d "$d" ] || continue
+            relname="$(basename "$d" | cut -d- -f2)"
+            mkdir -p "rel/$relname"
+            cp "$d"/* "rel/$relname/" 2>/dev/null || true
+          done
+          # Raw binaries too: the VPS side installs one of these directly, and
+          # provision-server.sh wants a URL plus a sha256 to verify against.
+          mkdir -p rel/binaries
+          for d in dl/olcrtc-*; do
+            [ -d "$d" ] || continue
+            cp "$d"/* rel/binaries/ 2>/dev/null || true
+          done
+          find rel -type f | sort
+
+      - name: checksums
+        run: |
+          set -euo pipefail
+          cd rel
+          find . -type f ! -name 'SHA256SUMS*' -print0 \
+            | sort -z | xargs -0 sha256sum > SHA256SUMS
+          cat SHA256SUMS
+
+      # Signing uses a repository secret. If it is absent the job fails rather
+      # than silently publishing unsigned artifacts.
+      - name: sign checksums
+        env:
+          SIGNING_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          SIGNING_PASS: ${{ secrets.MINISIGN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SIGNING_KEY:-}" ]; then
+            echo "::error::MINISIGN_SECRET_KEY is not set -- refusing to publish unsigned artifacts."
+            echo "Generate one with 'minisign -G' and add both secrets, or remove this job"
+            echo "deliberately if you accept unsigned releases."
+            exit 1
+          fi
+          sudo apt-get update -qq && sudo apt-get install -y -qq minisign
+          printf '%s' "$SIGNING_KEY" > /tmp/sk
+          printf '%s' "$SIGNING_PASS" | minisign -S -s /tmp/sk -m rel/SHA256SUMS
+          shred -u /tmp/sk
+          cat rel/SHA256SUMS.minisig
+
+      - name: build package feed indexes
+        run: |
+          set -euo pipefail
+          # A static feed lets users add one line and then `apk add` / `opkg
+          # install` normally, instead of downloading files by hand.
+          for relname in rel/*/; do
+            r="$(basename "$relname")"
+            [ "$r" = "binaries" ] && continue
+            echo "feed: $r ($(find "$relname" -type f | wc -l) packages)"
+          done
+          # Index generation needs the matching apk/opkg tooling and is done in
+          # the SDK containers during the build job in a later iteration; for
+          # now the release ships loose packages plus signed checksums.
+          echo "note: feed indexes are generated in a follow-up step (see docs/plan.md Phase 5)"
+
+      - name: publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            rel/SHA256SUMS
+            rel/SHA256SUMS.minisig
+            rel/binaries/*
+            rel/25.12*/*
+            rel/24.10*/*
+          fail_on_unmatched_files: false
+          generate_release_notes: true
+          body: |
+            ## Installing
+
+            **Router** — add the feed or install directly:
+
+            ```sh
+            # OpenWrt 25.12 (apk)
+            apk add --allow-untrusted ./olcrtc_*.apk ./luci-proto-olcrtc_*.apk
+            # OpenWrt 24.10 (opkg)
+            opkg install ./olcrtc_*.ipk ./luci-proto-olcrtc_*.ipk
+            ```
+
+            Then set the room and key, and enable the interface:
+            see `/usr/share/olcrtc/README` on the device.
+
+            **VPS** — verify before installing:
+
+            ```sh
+            sha256sum -c SHA256SUMS --ignore-missing
+            sudo ./provision-server.sh \
+              --binary ./olcrtc-x86_64 \
+              --room https://meet.example.org/<room>
+            ```
+
+            ### What this tunnel cannot carry
+
+            TCP over IPv4 only. UDP, QUIC and IPv6 are **rejected** rather than
+            allowed to leave over the clear WAN path. Some traffic will visibly
+            fail; that is the intended trade.

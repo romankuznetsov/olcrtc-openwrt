@@ -1,0 +1,21 @@
+# Reference only. The live config is rendered at ifup by
+# /lib/netifd/proto/olcrtc.sh into /var/run/olcrtc/. Editing this has no effect.
+#
+# Note what is absent and why:
+#   ipv6      omitted -- the tunnel is IPv4-only; an address would attract
+#             traffic it cannot carry
+#   pid-file  omitted -- keeps the process in the foreground so netifd can
+#             supervise it via proto_run_command
+tunnel:
+  name: olcrtc0
+  mtu: 8500
+  multi-queue: false
+  ipv4: 198.18.0.1
+  icmp: 'off'
+socks5:
+  address: 127.0.0.1
+  port: 8808
+  udp: 'udp'
+misc:
+  log-level: warn
+  limit-nofile: 8192

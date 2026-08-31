@@ -215,25 +215,31 @@ Start/Stop/Restart, an Edit form, and normal firewall-zone assignment.
 _olcrtc-openwrt/
 ├── UPSTREAM                              # pinned repo + commit + Go version
 ├── README.md
-├── docs/{plan.md, install.md, troubleshoot.md}
+├── docs/{plan.md, phase0-results.md, server-setup.md}
 ├── .github/workflows/{build.yml, release.yml}
 ├── scripts/
 │   ├── build-binary.sh                   # cross-compile from the pin
-│   ├── mkpkg-apk.sh                      # 25.12
-│   ├── mkpkg-ipk.sh                      # 24.10
-│   └── leak-check.sh                     # on-device: asserts no DNS/IPv6/UDP escape
+│   ├── phase0-device-check.sh            # read-only router checks
+│   └── provision-server.sh               # Phase S, Ubuntu 24.04
 └── package/
     ├── olcrtc/
-    │   ├── Makefile
+    │   ├── Makefile                      # packages the prebuilt binary
     │   └── files/
     │       ├── olcrtc.proto              # → /lib/netifd/proto/olcrtc.sh
-    │       ├── olcrtc.init               # procd, for socks-only mode
-    │       ├── hev-tunnel.yaml.template
-    │       └── olcrtc.uci-defaults       # creates the interface, does not enable it
+    │       ├── olcrtc-link               # → /usr/libexec; supervises both
+    │       │                             #   daemons + firewall rules
+    │       ├── olcrtc.uci-defaults       # interface, zone, DNS; disabled
+    │       ├── hev-tunnel.yaml.template  # reference only
+    │       ├── olcrtc.yaml.template      # reference only
+    │       └── README                    # → /usr/share/olcrtc/README
     └── luci-proto-olcrtc/
         ├── Makefile
         └── htdocs/luci-static/resources/protocol/olcrtc.js
 ```
+
+No `mkpkg-apk.sh` / `mkpkg-ipk.sh`: the OpenWrt SDK decides the output format
+from the release it belongs to, so a single Makefile yields ipk on 24.10 and apk
+on 25.12 with no format-specific code of ours.
 
 Two packages, following the `wireguard-tools` / `luci-proto-wireguard` convention: the proto
 handler ships with the daemon, the LuCI form is separate so a headless router need not install

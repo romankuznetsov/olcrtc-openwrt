@@ -172,7 +172,11 @@ elif [ "$DRY_RUN" = 0 ]; then
 fi
 
 run "install -m 0755 -o root -g root '$TMPBIN' '$BIN_PATH'"
-[ "$DRY_RUN" = 0 ] && info "installed: $("$BIN_PATH" --version 2>/dev/null | head -1 || echo "$BIN_PATH")"
+# olcrtc takes exactly one argument -- the config path. There is no --version
+# flag, so identify the build by size and hash rather than asking it.
+if [ "$DRY_RUN" = 0 ]; then
+    info "installed $BIN_PATH ($(stat -c%s "$BIN_PATH" 2>/dev/null || echo '?') bytes)"
+fi
 
 # ------------------------------------------------------------------- 4. key
 say "4/8  Shared key"

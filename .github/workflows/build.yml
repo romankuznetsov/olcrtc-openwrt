@@ -1,0 +1,203 @@
+name: build
+
+# Runs on every push and pull request. Gates before it publishes anything:
+# shellcheck on the scripts and the OpenWrt files, upstream's own test suite at
+# the pinned commit, and a package lint that catches the netifd mistakes which
+# otherwise only surface as a stuck interface on someone's router.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+  # Reused by release.yml so a tag builds through the same gates as a push,
+  # rather than a separate pipeline that can drift out of sync.
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shellcheck
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          # The netifd handler and uci-defaults are sourced by busybox ash and
+          # reference netifd helpers that shellcheck cannot see; -x follows
+          # sources where possible, and SC1090/SC1091 cover the rest.
+          shellcheck -s bash -S warning scripts/*.sh
+          shellcheck -s sh -S warning -e SC1090,SC1091 \
+            package/olcrtc/files/olcrtc.proto \
+            package/olcrtc/files/olcrtc-link \
+            package/olcrtc/files/olcrtc.uci-defaults
+
+      - name: package lint
+        run: |
+          set -e
+          P=package/olcrtc/files/olcrtc.proto
+          # A protocol handler missing any of these registers but never works,
+          # and a missing teardown is exactly what leaves an interface stuck
+          # "up" in LuCI with no way to stop it.
+          for fn in add_protocol proto_olcrtc_init_config proto_olcrtc_setup proto_olcrtc_teardown; do
+            grep -q "$fn" "$P" || { echo "::error file=$P::missing $fn"; exit 1; }
+          done
+          grep -q 'proto_send_update' "$P" || { echo "::error file=$P::never calls proto_send_update"; exit 1; }
+          # Declaring an option in the LuCI form that the handler does not read
+          # silently does nothing, which is worse than an error.
+          for opt in provider room transport key_file socks_port; do
+            grep -q "proto_config_add_.*\b$opt\b" "$P" || { echo "::error file=$P::option '$opt' not declared"; exit 1; }
+          done
+          echo "package lint ok"
+
+      - name: verify upstream pin is a full sha
+        run: |
+          . ./UPSTREAM
+          echo "$REF" | grep -Eq '^[0-9a-f]{40}$' || { echo "::error::REF must be a full 40-char sha"; exit 1; }
+          echo "pin ok: $REF"
+
+  upstream-tests:
+    name: upstream tests @ pin
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: read pin
+        id: pin
+        run: |
+          . ./UPSTREAM
+          echo "repo=$REPO"  >> "$GITHUB_OUTPUT"
+          echo "ref=$REF"    >> "$GITHUB_OUTPUT"
+          echo "go=$GO"      >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ steps.pin.outputs.go }}
+          cache: false
+
+      - name: fetch pinned upstream
+        run: |
+          git init -q src
+          git -C src remote add origin "${{ steps.pin.outputs.repo }}"
+          git -C src fetch -q --depth 1 origin "${{ steps.pin.outputs.ref }}"
+          git -C src checkout -q FETCH_HEAD
+
+      # We package upstream's code, so upstream's tests are our regression
+      # suite. If a pin bump breaks them we want to know here, not on a router.
+      - name: go vet
+        run: go -C src vet ./...
+      - name: go test
+        run: go -C src test ./...
+
+  build:
+    name: build ${{ matrix.arch }}
+    runs-on: ubuntu-24.04
+    needs: [lint, upstream-tests]
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - aarch64_cortex-a53
+          - aarch64_cortex-a72
+          - arm_cortex-a7
+          - x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: read pin
+        id: pin
+        run: |
+          . ./UPSTREAM
+          echo "go=$GO" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ steps.pin.outputs.go }}
+          cache: false
+
+      - name: build
+        run: ./scripts/build-binary.sh "${{ matrix.arch }}" ./out
+
+      # Phase 0 deferred the size measurement here rather than gating on it,
+      # since the target has ample storage. Recorded for the record.
+      - name: report size
+        run: |
+          f=./out/olcrtc-${{ matrix.arch }}
+          printf '### olcrtc %s\n\n- **%s bytes** (%s MiB)\n- `%s`\n' \
+            "${{ matrix.arch }}" "$(stat -c%s "$f")" "$(( $(stat -c%s "$f") / 1048576 ))" \
+            "$(cut -d' ' -f1 < "$f.sha256")" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: olcrtc-${{ matrix.arch }}
+          path: out/olcrtc-${{ matrix.arch }}*
+          if-no-files-found: error
+          retention-days: 14
+
+  package:
+    name: package ${{ matrix.release }} ${{ matrix.arch }}
+    runs-on: ubuntu-24.04
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # SDK images are per target/subtarget, not per architecture, so each
+          # arch is built against a representative target that produces it.
+          # 25.12 -> apk, 24.10 -> ipk; the SDK decides the format, which is
+          # why one Makefile covers both.
+          - { release: '25.12.5', arch: aarch64_cortex-a53, sdk: 'mediatek-filogic' }
+          - { release: '25.12.5', arch: aarch64_cortex-a72, sdk: 'bcm27xx-bcm2711' }
+          - { release: '25.12.5', arch: arm_cortex-a7,      sdk: 'sunxi-cortexa7'   }
+          - { release: '25.12.5', arch: x86_64,             sdk: 'x86-64'           }
+          - { release: '24.10.8', arch: aarch64_cortex-a53, sdk: 'mediatek-filogic' }
+          - { release: '24.10.8', arch: aarch64_cortex-a72, sdk: 'bcm27xx-bcm2711' }
+          - { release: '24.10.8', arch: arm_cortex-a7,      sdk: 'sunxi-cortexa7'   }
+          - { release: '24.10.8', arch: x86_64,             sdk: 'x86-64'           }
+    container:
+      image: openwrt/sdk:${{ matrix.sdk }}-${{ matrix.release }}
+      options: --user root
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: repo
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: olcrtc-${{ matrix.arch }}
+          path: bin
+
+      - name: stage and build packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /builder
+          cp -r "$GITHUB_WORKSPACE/repo/package/olcrtc" package/
+          cp -r "$GITHUB_WORKSPACE/repo/package/luci-proto-olcrtc" package/
+          # The Makefile installs a prebuilt binary rather than compiling, so
+          # the SDK's Go version is irrelevant -- this is what decouples us
+          # from it. See docs/plan.md.
+          mkdir -p package/olcrtc/prebuilt
+          install -m 0755 "$GITHUB_WORKSPACE/bin/olcrtc-${{ matrix.arch }}" \
+                          package/olcrtc/prebuilt/olcrtc
+          ./scripts/feeds update -a >/dev/null
+          ./scripts/feeds install -a >/dev/null
+          make defconfig >/dev/null
+          make package/olcrtc/compile V=s
+          make package/luci-proto-olcrtc/compile V=s
+          mkdir -p "$GITHUB_WORKSPACE/pkgs"
+          find bin/ -name 'olcrtc*.apk' -o -name 'olcrtc*.ipk' \
+               -o -name 'luci-proto-olcrtc*.apk' -o -name 'luci-proto-olcrtc*.ipk' \
+            | xargs -r -I{} cp {} "$GITHUB_WORKSPACE/pkgs/"
+          ls -la "$GITHUB_WORKSPACE/pkgs/"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pkg-${{ matrix.release }}-${{ matrix.arch }}
+          path: pkgs/*
+          if-no-files-found: error
+          retention-days: 14

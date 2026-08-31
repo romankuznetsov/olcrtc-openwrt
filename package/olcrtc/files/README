@@ -1,0 +1,46 @@
+olcrtc for OpenWrt
+==================
+
+The tunnel is a network interface. Configure it in LuCI under
+Network -> Interfaces -> olcrtc, or with uci:
+
+    uci set network.olcrtc.room='https://meet.example.org/<your-room>'
+    uci set network.olcrtc.auto='1'
+    uci commit network
+    ifup olcrtc
+
+The shared key is a file, never a uci value:
+
+    mkdir -p /etc/olcrtc
+    # paste the SAME 64 hex characters used by the server
+    printf '%s' '<64-hex-chars>' > /etc/olcrtc/olcrtc.key
+    chgrp olcrtc /etc/olcrtc/olcrtc.key
+    chmod 0640 /etc/olcrtc/olcrtc.key
+
+Client and server must agree on provider, room, transport and key. Disagree on
+any one and the link silently never forms -- there is no "wrong key" error, it
+simply never connects.
+
+WHAT THIS TUNNEL CANNOT CARRY
+-----------------------------
+TCP over IPv4, and nothing else. olcRTC's SOCKS5 accepts CONNECT only and its
+server egress dials tcp4.
+
+So UDP, QUIC and IPv6 are REJECTED while the interface is up, rather than being
+allowed to take the clear WAN path. Consequences worth knowing:
+
+  * QUIC is blocked so browsers fall back to TCP. Sites work; a few are slower.
+  * IPv6 forwarding is refused. Set block_ipv6='0' only if you understand that
+    IPv6 traffic then leaves unencrypted.
+  * Anything UDP-only -- some games, some VoIP, WireGuard inside the tunnel --
+    will not work at all. This is a property of olcRTC, not of this package.
+
+TROUBLESHOOTING
+---------------
+    logread -e olcrtc              # both daemons log here
+    ifstatus olcrtc                # netifd's view
+    ubus call network.interface.olcrtc status
+
+Interface will not come up: check that the key file exists and is readable by
+the olcrtc user, and that the room URL is reachable from this router in a
+browser on the LAN.

@@ -1,0 +1,14 @@
+# Everything here is deployed to Linux (OpenWrt routers, an Ubuntu VPS).
+# CRLF in a shell script produces "bad interpreter: no such file or directory",
+# so force LF regardless of the checkout platform.
+* text=auto eol=lf
+
+*.sh          text eol=lf
+olcrtc.proto  text eol=lf
+olcrtc-link   text eol=lf
+*.uci-defaults text eol=lf
+Makefile      text eol=lf
+*.yml         text eol=lf
+*.yaml        text eol=lf
+*.js          text eol=lf
+*.md          text eol=lf
