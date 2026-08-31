@@ -51,9 +51,10 @@ The tunnel carries TCP over IPv4 only. UDP, QUIC and IPv6 cannot traverse it
 and are rejected rather than allowed to leak; see /usr/share/olcrtc/README.
 endef
 
-define Package/olcrtc/conffiles
-/etc/config/olcrtc
-endef
+# No conffiles. An earlier version declared /etc/config/olcrtc, which nothing
+# creates: the settings live in the `olcrtc` interface in /etc/config/network
+# and in the firewall zone, both seeded by uci-defaults. Declaring a path that
+# does not exist made sysupgrade preserve nothing while looking like it did.
 
 # Nothing to configure, patch or compile: Build/Compile is intentionally a
 # no-op. The binary already exists.

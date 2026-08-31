@@ -14,10 +14,17 @@ through it with no client-side setup on any device.
 | Server | Ubuntu 24.04 LTS, x86_64 |
 | Upstream | Pinned commit, built with the official Go toolchain — see [`UPSTREAM`](UPSTREAM) |
 
-> **Status: unvalidated on hardware.** Phases 0-5 are written — build pipeline, the netifd
-> protocol handler, leak prevention, the LuCI form and VPS provisioning. Nothing has run on a
-> router or through CI yet, so treat the first install as Phase 6 (validation).
-> See [docs/plan.md](docs/plan.md).
+> **Status: validated on one router, 2026-08-31** (Huasifei WH3000 Pro, OpenWrt 25.12.2,
+> Jitsi provider, datachannel transport). Traffic carried end to end, `leak-check.sh` 8/8,
+> kill-switch confirmed by taking the tunnel down with a real client behind it. Not yet run
+> through CI, on 24.10/ipk, or on any other architecture.
+>
+> Two defects were found by that first install and are fixed here: a `confirm_timeout` left
+> non-zero takes the interface down four minutes after every boot and it stays down
+> (`ifdown` is sticky), and **the kill-switch cannot be built from rules this handler
+> installs** — teardown removes them, so clients revert to the clear WAN exactly when the
+> tunnel fails. `route_mode 'mark'` exists for that reason; see
+> [docs/plan.md](docs/plan.md) Phase 4.
 
 ---
 
@@ -59,6 +66,7 @@ UPSTREAM                          pinned upstream commit + Go version
 docs/                             plan, Phase 0 findings, VPS walkthrough
 scripts/
   build-binary.sh                 cross-compile olcRTC from the pin
+  leak-check.sh                   assert no leak, both tunnel states (run on the router)
   phase0-device-check.sh          read-only router checks
   provision-server.sh             VPS provisioning (Ubuntu 24.04)
 package/

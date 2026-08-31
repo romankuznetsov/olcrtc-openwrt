@@ -413,7 +413,39 @@ verified with `curl --socks5`.
   interface is up. Optionally stop advertising IPv6 on the LAN so clients never acquire an
   address they cannot use.
 - **Kill-switch:** if olcRTC dies, traffic fails closed rather than falling back to the clear
-  WAN path. netifd marks the interface down and the firewall does not open in the gap.
+  WAN path.
+
+  **Rules this handler installs cannot be the kill-switch.** They are removed by
+  `proto_olcrtc_teardown`, and a crash, an `ifdown` and the auto-revert firing all reach
+  teardown -- so at the moment protection is needed most, there is none. Verified on
+  hardware 2026-08-31: the tunnel self-reverted after 240 s and every LAN session forwarded
+  out the clear WAN for two hours with nothing logging it.
+
+  `route_mode 'mark'` is the answer. The handler installs no policy rules; two static
+  stanzas in `/etc/config/network` route an fwmark into `$table` and fail closed behind it,
+  and a firewall MARK rule decides which clients carry the mark:
+
+  ```
+  config rule
+      option mark '0x4'
+      option lookup '8808'
+      option priority '140'
+
+  config rule
+      option mark '0x4'
+      option action 'unreachable'
+      option priority '150'
+  ```
+
+  netifd owns those, so they exist whether or not the handler has ever run, and teardown
+  flushing `$table` is what arms the second. It also composes with tunnels the router
+  already has instead of sitting after them, needs no uid or CIDR exemptions (nothing is
+  captured by default), and leaves router-originated traffic alone -- so ntp, mail and
+  package installs keep working while the tunnel is down.
+
+  `route_mode 'catchall'` keeps the original self-contained behaviour for a router where
+  this is the only tunnel. Note its default `rule_base` of 140 collides with the example
+  above; move it if both are ever used together.
 - `scripts/leak-check.sh` asserts all four from the router and exits non-zero on any leak.
 
 ### Phase 5 — LuCI package

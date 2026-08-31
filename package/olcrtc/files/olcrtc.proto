@@ -19,22 +19,59 @@
 init_proto "$@"
 
 OLC_RUNDIR=/var/run/olcrtc
+# Set per-interface in setup and teardown; empty here so _clear_rules is safe
+# to call before it has a value.
+OLC_RULES_FILE=""
 # Never routed into the tunnel. RFC1918 plus link-local, multicast and CGNAT:
 # the tunnel cannot carry them, and capturing them cuts off local management.
 OLC_BYPASS_DEFAULT="10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 224.0.0.0/4 100.64.0.0/10"
 
-# Policy-rule band. Deliberately 140-150 and not the more obvious 90-110:
-# OpenWrt routers commonly already have fwmark rules around 100-130 for other
-# tunnels (WireGuard at 120/130, for instance). Sitting after them means those
-# tunnels keep their existing behaviour and we only claim traffic that would
-# otherwise have fallen through to main.
-#   140      uid 8808        -> main    (olcRTC reaches the SFU)
-#   141-146  bypass CIDRs    -> main    (local subnets, incl. management)
-#   150      everything else -> $table  (the tunnel)
-OLC_PREF_UID=140
-OLC_PREF_BYPASS=141
-OLC_PREF_ICMP=147
-OLC_PREF_ALL=150
+# Two ways to decide what enters the tunnel, selected by route_mode:
+#
+#   catchall (default)  This handler installs the policy rules itself: a
+#                       catch-all sending everything to $table, with
+#                       exemptions in front of it. Self-contained, and the
+#                       right choice when the tunnel is the router's only
+#                       tunnel. It necessarily captures router-originated
+#                       traffic too, which is why the exemptions exist.
+#
+#   mark                The handler installs NO policy rules. Something else
+#                       -- normally two `config rule` stanzas in
+#                       /etc/config/network -- routes an fwmark into $table and
+#                       fails closed behind it, and a firewall MARK rule
+#                       decides which clients get that mark. Nothing is
+#                       exempted because nothing is captured by default: only
+#                       marked traffic is claimed, so router-originated traffic
+#                       is untouched and no uid or CIDR exemption is needed.
+#
+#                       Choose this on a router that already policy-routes
+#                       through other tunnels: the lane then composes with them
+#                       instead of sitting after them, and moving a client
+#                       between tunnels is a one-word change to its mark.
+#
+#                       The kill-switch belongs to the static rules, not here.
+#                       That is the point: rules this handler installs vanish
+#                       with the handler, and a kill-switch that disappears
+#                       when the tunnel dies is not a kill-switch.
+#
+# Policy-rule band for catchall mode. Deliberately high and not the more
+# obvious 90-110: OpenWrt routers commonly already have fwmark rules around
+# 100-130 for other tunnels (WireGuard at 120/130, for instance). Sitting after
+# them means those tunnels keep their existing behaviour and we only claim
+# traffic that would otherwise have fallen through to main.
+#
+#   $base          uid 8808        -> main    (olcRTC reaches the SFU)
+#   $base+1 ...    bypass CIDRs    -> main    (local subnets, incl. management)
+#   (after those)  ipproto icmp    -> main    (when icmp_mode=bypass)
+#   $base+59       everything else -> $table  (the tunnel)
+#
+# Every pref actually installed is recorded in $OLC_RUNDIR/rules.<cfg> and only
+# those are removed on teardown. An earlier version swept a hardcoded
+# base..base+9 window, which silently leaked rules once bypass_cidr held ten or
+# more entries -- the tenth landed on the catch-all's own pref and the eleventh
+# was never cleaned up, so restarts accumulated stale rules.
+OLC_PREF_BASE_DEFAULT=140
+OLC_PREF_ALL_OFFSET=59
 OLC_SHARE=/usr/share/olcrtc
 OLC_UID=8808
 
@@ -61,6 +98,8 @@ proto_olcrtc_init_config() {
 	proto_config_add_int     "confirm_timeout"
 	proto_config_add_string  "icmp_mode"
 	proto_config_add_boolean "icmp_reply"
+	proto_config_add_string  "route_mode"
+	proto_config_add_int     "rule_base"
 }
 
 # Can uid/gid 8808 read this file? Parses `ls -ln` because busybox on OpenWrt
@@ -175,15 +214,25 @@ misc:
 EOF
 }
 
-# Remove every rule this handler installs. Idempotent, and safe to call when
-# none are present.
+# Install a policy rule and remember its pref, so teardown removes exactly what
+# setup added rather than sweeping a guessed range.
+_add_rule() {
+	local pref="$1"; shift
+	# shellcheck disable=SC2086 # deliberate word split: rule selector args
+	ip rule add pref "$pref" $* 2>/dev/null || return 1
+	echo "$pref" >> "$OLC_RULES_FILE"
+}
+
+# Remove every rule this handler installed. Idempotent, and safe to call when
+# none are present -- including in mark mode, where the file never exists
+# because the handler installs no rules at all.
 _clear_rules() {
-	local p="$OLC_PREF_UID"
-	while [ $p -le $((OLC_PREF_BYPASS + 9)) ]; do
-		ip rule del pref "$p" 2>/dev/null
-		p=$((p + 1))
-	done
-	ip rule del pref "$OLC_PREF_ALL" 2>/dev/null
+	local p
+	[ -f "$OLC_RULES_FILE" ] || return 0
+	while read -r p; do
+		[ -n "$p" ] && ip rule del pref "$p" 2>/dev/null
+	done < "$OLC_RULES_FILE"
+	rm -f "$OLC_RULES_FILE"
 }
 
 proto_olcrtc_setup() {
@@ -193,7 +242,7 @@ proto_olcrtc_setup() {
 
 	json_get_vars provider room transport key_file socks_port tun_addr mtu \
 	              dns_addr block_quic block_ipv6 default_route metric table \
-	              confirm_timeout icmp_mode icmp_reply
+	              confirm_timeout icmp_mode icmp_reply route_mode rule_base
 
 	# Defaults. Kept here rather than only in the LuCI form so a
 	# hand-written /etc/config/network entry works too.
@@ -211,6 +260,18 @@ proto_olcrtc_setup() {
 	[ -n "$dns_addr" ]   || dns_addr="1.1.1.1:53"
 	[ -n "$metric" ]     || metric=10
 	[ -n "$table" ]      || table=8808
+	[ -n "$route_mode" ] || route_mode="catchall"
+	[ -n "$rule_base" ]  || rule_base="$OLC_PREF_BASE_DEFAULT"
+
+	case "$route_mode" in
+	catchall|mark) ;;
+	*)
+		echo "olcrtc: route_mode '$route_mode' is not 'catchall' or 'mark'" >&2
+		proto_notify_error "$cfg" BAD_ROUTE_MODE
+		proto_block_restart "$cfg"
+		return 1
+		;;
+	esac
 
 	json_get_values bypass_cidr_list bypass_cidr 2>/dev/null
 	OLC_BYPASS="${bypass_cidr_list:-$OLC_BYPASS_DEFAULT}"
@@ -270,6 +331,7 @@ proto_olcrtc_setup() {
 	chmod 0750 "$OLC_RUNDIR"
 	local olc_yaml="$OLC_RUNDIR/olcrtc-$cfg.yaml"
 	local hev_yaml="$OLC_RUNDIR/hev-$cfg.yaml"
+	OLC_RULES_FILE="$OLC_RUNDIR/rules.$cfg"
 
 	_render_olcrtc_yaml "$olc_yaml"
 	chown olcrtc "$olc_yaml" 2>/dev/null
@@ -295,51 +357,68 @@ proto_olcrtc_setup() {
 	[ "$icmp_mode" = "reply" ] && hev_icmp=reply
 	_render_hev_yaml "$hev_yaml" "$iface" "$hev_icmp"
 
-	# Loop prevention. olcRTC's own traffic to the conferencing service must
-	# use the main table, or it is routed into the tunnel it is building.
-	# Keyed on uid rather than destination because the service addresses are
-	# dynamic and change on failover.
-	# The tunnel default lives in its own table, NOT in main. An earlier
-	# version put it in main and exempted olcRTC *to* main, which exempted
-	# nothing -- 0.0.0.0/1 is more specific than the default route, so the
-	# exempted traffic followed the tunnel too and bring-up deadlocked.
-	#
-	#   pref  90  uid 8808      -> main   (WAN; olcRTC reaches the SFU)
-	#   pref 110  everything    -> $table (the tunnel)
 	_clear_rules
 	local use_fwmark=0
-	if ! ip rule add pref "$OLC_PREF_UID" uidrange "$OLC_UID-$OLC_UID" lookup main 2>/dev/null; then
-		echo "olcrtc: 'ip rule uidrange' unsupported; falling back to fwmark" >&2
-		# Fallback only. The nftables chain that sets this mark is emitted
-		# solely in this branch -- installed alongside a working uidrange rule
-		# it breaks it, because its "route" hook re-routes without the socket
-		# uid and the exemption stops matching.
-		ip rule add pref "$OLC_PREF_UID" fwmark 0x8808 lookup main 2>/dev/null
-		use_fwmark=1
-	fi
 
-	# Directly-connected and private destinations must stay on main.
-	#
-	# Without this, the catch-all rule at pref 110 also captures the router's
-	# replies to hosts on its own LAN and WAN subnets -- including the SSH
-	# session you are administering it from. Those replies go into the tunnel,
-	# which cannot route RFC1918, and the router silently becomes unreachable
-	# with no way back in except a power cycle. Learned the hard way.
-	local p="$OLC_PREF_BYPASS" cidr
-	for cidr in $OLC_BYPASS; do
-		ip rule add pref "$p" to "$cidr" lookup main 2>/dev/null
-		p=$((p + 1))
-	done
-
-	# Send ICMP out the WAN so ping works for real. Uses an ip rule rather than
-	# an nftables mark deliberately: a "route" hook chain re-routes after
-	# marking and loses the socket uid, which silently breaks the uidrange
-	# exemption above. Learned that the hard way.
-	if [ "$icmp_mode" = "bypass" ]; then
-		if ! ip rule add pref "$OLC_PREF_ICMP" ipproto icmp lookup main 2>/dev/null; then
-			echo "olcrtc: 'ip rule ipproto' unsupported; ICMP will be rejected instead" >&2
-			icmp_mode="reject"
+	if [ "$route_mode" = "catchall" ]; then
+		# Loop prevention. olcRTC's own traffic to the conferencing service
+		# must use the main table, or it is routed into the tunnel it is
+		# building. Keyed on uid rather than destination because the service
+		# addresses are dynamic and change on failover.
+		#
+		# The tunnel default lives in its own table, NOT in main. An earlier
+		# version put it in main and exempted olcRTC *to* main, which exempted
+		# nothing -- 0.0.0.0/1 is more specific than the default route, so the
+		# exempted traffic followed the tunnel too and bring-up deadlocked.
+		#
+		#   $base       uid 8808      -> main   (WAN; olcRTC reaches the SFU)
+		#   $base+1..   bypass CIDRs  -> main
+		#   $base+59    everything    -> $table (the tunnel)
+		if ! _add_rule "$rule_base" uidrange "$OLC_UID-$OLC_UID" lookup main; then
+			echo "olcrtc: 'ip rule uidrange' unsupported; falling back to fwmark" >&2
+			# Fallback only. The nftables chain that sets this mark is emitted
+			# solely in this branch -- installed alongside a working uidrange
+			# rule it breaks it, because its "route" hook re-routes without the
+			# socket uid and the exemption stops matching.
+			_add_rule "$rule_base" fwmark 0x8808 lookup main
+			use_fwmark=1
 		fi
+
+		# Directly-connected and private destinations must stay on main.
+		#
+		# Without this, the catch-all rule also captures the router's replies to
+		# hosts on its own LAN and WAN subnets -- including the SSH session you
+		# are administering it from. Those replies go into the tunnel, which
+		# cannot route RFC1918, and the router silently becomes unreachable with
+		# no way back in except a power cycle. Learned the hard way.
+		local p=$((rule_base + 1)) cidr
+		for cidr in $OLC_BYPASS; do
+			_add_rule "$p" to "$cidr" lookup main
+			p=$((p + 1))
+		done
+
+		# Send ICMP out the WAN so ping works for real. Uses an ip rule rather
+		# than an nftables mark deliberately: a "route" hook chain re-routes
+		# after marking and loses the socket uid, which silently breaks the
+		# uidrange exemption above. Learned that the hard way.
+		if [ "$icmp_mode" = "bypass" ]; then
+			if ! _add_rule "$p" ipproto icmp lookup main; then
+				echo "olcrtc: 'ip rule ipproto' unsupported; ICMP will be rejected instead" >&2
+				icmp_mode="reject"
+			fi
+		fi
+	else
+		# mark mode: no policy rules here at all. The fwmark rule and the
+		# kill-switch behind it are declared statically (see the route_mode
+		# comment at the top), so they exist whether or not this handler has
+		# ever run -- which is what makes the kill-switch one.
+		#
+		# No exemptions are needed either: only marked traffic is claimed, and
+		# a firewall MARK rule scoped to a client-facing interface cannot mark
+		# router-originated traffic. ICMP from a marked client still reaches the
+		# TUN, so leave icmp_mode alone -- olcrtc-link rejects it there, which
+		# fails fast instead of blackholing.
+		[ "$icmp_mode" = "bypass" ] && icmp_mode="reject"
 	fi
 
 	proto_export "INTERFACE=$cfg"
@@ -378,8 +457,11 @@ proto_olcrtc_setup() {
 	fi
 	proto_send_update "$cfg"
 
-	if [ "${default_route:-1}" = 1 ]; then
-		ip rule add pref "$OLC_PREF_ALL" lookup "$table" 2>/dev/null
+	# The catch-all goes in last, after the route it depends on exists. In mark
+	# mode there is nothing to add: the static fwmark rule is already pointing
+	# at $table and starts matching the moment the route lands.
+	if [ "${default_route:-1}" = 1 ] && [ "$route_mode" = "catchall" ]; then
+		_add_rule $((rule_base + OLC_PREF_ALL_OFFSET)) lookup "$table"
 	fi
 
 	# Safety net for remote administration: if enabling the default route
@@ -400,11 +482,16 @@ proto_olcrtc_teardown() {
 	local table
 	json_get_vars table
 	[ -n "$table" ] || table=8808
+	OLC_RULES_FILE="$OLC_RUNDIR/rules.$cfg"
 
 	/usr/libexec/olcrtc-link --disarm-revert
 	/usr/libexec/olcrtc-link --firewall-down "$iface"
 
 	_clear_rules
+	# Flushing the table is what arms the kill-switch in mark mode: the static
+	# fwmark rule then finds no route and falls through to the `unreachable`
+	# rule behind it, so marked clients fail closed instead of reverting to the
+	# clear WAN path. Do not leave a stale default here.
 	ip route flush table "${table:-8808}" 2>/dev/null
 
 	proto_kill_command "$cfg"
