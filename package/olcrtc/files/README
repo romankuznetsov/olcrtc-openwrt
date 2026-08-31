@@ -34,6 +34,13 @@ allowed to take the clear WAN path. Consequences worth knowing:
     IPv6 traffic then leaves unencrypted.
   * Anything UDP-only -- some games, some VoIP, WireGuard inside the tunnel --
     will not work at all. This is a property of olcRTC, not of this package.
+  * ping does not work to tunnelled destinations. ICMP is not TCP, so it cannot
+    cross a SOCKS5 CONNECT tunnel either. It fails immediately with
+    "Packet filtered" rather than hanging. Use TCP to test reachability, e.g.
+    `curl https://api.ipify.org` -- which also shows the exit IP.
+    Setting icmp_reply='1' makes the local bridge answer pings itself so they
+    appear to work, but those replies are synthetic: they also succeed for
+    addresses that do not exist, so ping stops being a useful diagnostic.
 
 TROUBLESHOOTING
 ---------------

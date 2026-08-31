@@ -58,6 +58,7 @@ proto_olcrtc_init_config() {
 	proto_config_add_int     "table"
 	proto_config_add_array   "bypass_cidr"
 	proto_config_add_int     "confirm_timeout"
+	proto_config_add_boolean "icmp_reply"
 }
 
 # Can uid/gid 8808 read this file? Parses `ls -ln` because busybox on OpenWrt
@@ -139,7 +140,11 @@ _render_hev_yaml() {
 	# ipv6 is deliberately OMITTED: the tunnel is IPv4-only, and giving the
 	# TUN an IPv6 address would attract traffic it cannot carry.
 	#
-	# icmp is 'off' because ICMP cannot traverse a SOCKS5 CONNECT either.
+	# icmp is 'off' by default: ICMP cannot traverse a SOCKS5 CONNECT any
+	# more than UDP can, so it is dropped and the firewall rejects it fast.
+	# 'reply' makes hev answer echo requests ITSELF -- ping then appears to
+	# work, but the reply is synthetic and says nothing about whether the
+	# destination is reachable. Opt-in via icmp_reply.
 	#
 	# udp is 'udp' only because the key is mandatory. olcRTC rejects both
 	# UDP ASSOCIATE and the hev UDP-in-TCP extension, so UDP fails whatever
@@ -155,7 +160,7 @@ tunnel:
   mtu: $mtu
   multi-queue: false
   ipv4: $tun_addr
-  icmp: 'off'
+  icmp: '$3'
 
 socks5:
   address: 127.0.0.1
@@ -186,7 +191,7 @@ proto_olcrtc_setup() {
 
 	json_get_vars provider room transport key_file socks_port tun_addr mtu \
 	              dns_addr block_quic block_ipv6 default_route metric table \
-	              confirm_timeout
+	              confirm_timeout icmp_reply
 
 	# Defaults. Kept here rather than only in the LuCI form so a
 	# hand-written /etc/config/network entry works too.
@@ -266,7 +271,9 @@ proto_olcrtc_setup() {
 
 	_render_olcrtc_yaml "$olc_yaml"
 	chown olcrtc "$olc_yaml" 2>/dev/null
-	_render_hev_yaml "$hev_yaml" "$iface"
+	local hev_icmp=off
+	[ "${icmp_reply:-0}" = 1 ] && hev_icmp=reply
+	_render_hev_yaml "$hev_yaml" "$iface" "$hev_icmp"
 
 	# Loop prevention. olcRTC's own traffic to the conferencing service must
 	# use the main table, or it is routed into the tunnel it is building.
@@ -353,7 +360,7 @@ proto_olcrtc_setup() {
 	# Leak prevention. Applied after the interface is up so the rules never
 	# exist without the tunnel behind them.
 	/usr/libexec/olcrtc-link --firewall-up "$iface" \
-		"${block_quic:-1}" "${block_ipv6:-1}"
+		"${block_quic:-1}" "${block_ipv6:-1}" "$use_fwmark" "${icmp_reply:-0}"
 }
 
 proto_olcrtc_teardown() {

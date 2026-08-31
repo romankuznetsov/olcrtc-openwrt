@@ -137,7 +137,7 @@ Whole-LAN transparent routing verified end to end — LAN → `olcrtc0` →
 Measured binary sizes, which Phase 0 deferred: **28 MiB** (aarch64), **30 MiB** (x86_64).
 My earlier 18–25 MB estimate was low.
 
-## Ten bugs found, none visible in review
+## Twelve bugs found, none visible in review
 
 1. **busybox has neither `su` nor `stat`.** The key-readability check used `su`, which fails
    unconditionally when absent, so the interface could never start.
@@ -173,6 +173,14 @@ My earlier 18–25 MB estimate was low.
     `olcrtc0`. Verified against the shipped `wireguard.js` on the device, which is the reliable
     way to pin this API down; `registerPatternVirtual` is used by 18 shipped protocols.
 
+11. **`fw4 reload` does not remove orphaned chains.** A chain an include previously defined and
+    no longer does stays in the live ruleset and keeps matching, so toggling an option appeared
+    to do nothing. Our chains are now deleted explicitly before each reload.
+12. **A shell call site silently lost two arguments.** `firewall_up` grew `use_fwmark` and
+    `icmp_reply` parameters but the caller was never updated, so both defaulted to 0. Shell
+    does not complain about missing positional arguments; the fwmark fallback would simply
+    never have been emitted on a kernel lacking `uidrange`.
+
 ## Operational notes
 
 **Allow settling time.** The first 30–60 s after bring-up is unstable while both ends
@@ -188,6 +196,12 @@ olcRTC uses a direct resolver (uid-exempted, always reachable); LAN clients stil
 through DoH over the tunnel. Give the DoH proxy an **IP-literal** resolver URL so it needs no
 plaintext bootstrap lookup, and make sure dnsmasq has no dead upstreams — a stale entry for a
 removed instance causes intermittent resolution failures.
+
+**ICMP cannot traverse the tunnel**, for the same reason UDP cannot: olcRTC's SOCKS5 is
+CONNECT-only. `ping` to a tunnelled destination now fails immediately with "Packet filtered"
+instead of timing out silently. `icmp_reply='1'` makes the bridge answer pings locally, but the
+replies are synthetic — verified by pinging 203.0.113.99, a TEST-NET address that cannot answer,
+and getting 0% loss. Test reachability with TCP instead.
 
 **`meet.jit.si` requires a token** and cannot be used. Upstream's curated instance list exists
 for this reason; verify a candidate is reachable from *both* ends before committing to it.

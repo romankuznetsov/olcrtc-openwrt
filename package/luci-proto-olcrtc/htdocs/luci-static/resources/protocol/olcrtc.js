@@ -91,6 +91,11 @@ return network.registerProtocol('olcrtc', {
 			_('The tunnel is IPv4-only. With this off, LAN IPv6 traffic leaves over the WAN unencrypted while the tunnel appears to be up.'));
 		o.default = '1';
 
+		o = s.taboption('advanced', form.Flag, 'icmp_reply',
+			_('Fake ping replies'),
+			_('ICMP cannot traverse this tunnel, so ping normally fails instantly with "Packet filtered". Enabling this makes the local bridge answer pings itself: ping appears to work, but the reply is synthetic and succeeds even for addresses that do not exist, which makes ping useless as a diagnostic. Off by default.'));
+		o.default = '0';
+
 		o = s.taboption('advanced', form.Value, 'dns_addr',
 			_('DNS resolver'),
 			_('Resolver used by olcRTC itself. Must be reachable WITHOUT the tunnel: pointing this at the router\'s local DoH proxy deadlocks bring-up, because that proxy\'s own traffic goes through the tunnel and the tunnel needs DNS to connect. LAN clients are unaffected and still resolve through DoH.'));
