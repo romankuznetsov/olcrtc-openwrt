@@ -22,6 +22,18 @@ OLC_RUNDIR=/var/run/olcrtc
 # Never routed into the tunnel. RFC1918 plus link-local, multicast and CGNAT:
 # the tunnel cannot carry them, and capturing them cuts off local management.
 OLC_BYPASS_DEFAULT="10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 224.0.0.0/4 100.64.0.0/10"
+
+# Policy-rule band. Deliberately 140-150 and not the more obvious 90-110:
+# OpenWrt routers commonly already have fwmark rules around 100-130 for other
+# tunnels (WireGuard at 120/130, for instance). Sitting after them means those
+# tunnels keep their existing behaviour and we only claim traffic that would
+# otherwise have fallen through to main.
+#   140      uid 8808        -> main    (olcRTC reaches the SFU)
+#   141-146  bypass CIDRs    -> main    (local subnets, incl. management)
+#   150      everything else -> $table  (the tunnel)
+OLC_PREF_UID=140
+OLC_PREF_BYPASS=141
+OLC_PREF_ALL=150
 OLC_SHARE=/usr/share/olcrtc
 OLC_UID=8808
 
@@ -159,12 +171,12 @@ EOF
 # Remove every rule this handler installs. Idempotent, and safe to call when
 # none are present.
 _clear_rules() {
-	local p=90
-	while [ $p -le 96 ]; do
+	local p="$OLC_PREF_UID"
+	while [ $p -le $((OLC_PREF_BYPASS + 9)) ]; do
 		ip rule del pref "$p" 2>/dev/null
 		p=$((p + 1))
 	done
-	ip rule del pref 110 2>/dev/null
+	ip rule del pref "$OLC_PREF_ALL" 2>/dev/null
 }
 
 proto_olcrtc_setup() {
@@ -173,7 +185,8 @@ proto_olcrtc_setup() {
 	local OLC_BYPASS
 
 	json_get_vars provider room transport key_file socks_port tun_addr mtu \
-	              dns_addr block_quic block_ipv6 default_route metric
+	              dns_addr block_quic block_ipv6 default_route metric table \
+	              confirm_timeout
 
 	# Defaults. Kept here rather than only in the LuCI form so a
 	# hand-written /etc/config/network entry works too.
@@ -267,11 +280,15 @@ proto_olcrtc_setup() {
 	#   pref  90  uid 8808      -> main   (WAN; olcRTC reaches the SFU)
 	#   pref 110  everything    -> $table (the tunnel)
 	_clear_rules
-	if ! ip rule add pref 90 uidrange "$OLC_UID-$OLC_UID" lookup main 2>/dev/null; then
+	local use_fwmark=0
+	if ! ip rule add pref "$OLC_PREF_UID" uidrange "$OLC_UID-$OLC_UID" lookup main 2>/dev/null; then
 		echo "olcrtc: 'ip rule uidrange' unsupported; falling back to fwmark" >&2
-		# Fallback for kernels/iproute2 without uidrange. The nftables rule
-		# that sets this mark ships in the firewall include.
-		ip rule add pref 90 fwmark 0x8808 lookup main 2>/dev/null
+		# Fallback only. The nftables chain that sets this mark is emitted
+		# solely in this branch -- installed alongside a working uidrange rule
+		# it breaks it, because its "route" hook re-routes without the socket
+		# uid and the exemption stops matching.
+		ip rule add pref "$OLC_PREF_UID" fwmark 0x8808 lookup main 2>/dev/null
+		use_fwmark=1
 	fi
 
 	# Directly-connected and private destinations must stay on main.
@@ -281,7 +298,7 @@ proto_olcrtc_setup() {
 	# session you are administering it from. Those replies go into the tunnel,
 	# which cannot route RFC1918, and the router silently becomes unreachable
 	# with no way back in except a power cycle. Learned the hard way.
-	local p=91 cidr
+	local p="$OLC_PREF_BYPASS" cidr
 	for cidr in $OLC_BYPASS; do
 		ip rule add pref "$p" to "$cidr" lookup main 2>/dev/null
 		p=$((p + 1))
@@ -324,7 +341,7 @@ proto_olcrtc_setup() {
 	proto_send_update "$cfg"
 
 	if [ "${default_route:-1}" = 1 ]; then
-		ip rule add pref 110 lookup "$table" 2>/dev/null
+		ip rule add pref "$OLC_PREF_ALL" lookup "$table" 2>/dev/null
 	fi
 
 	# Safety net for remote administration: if enabling the default route
