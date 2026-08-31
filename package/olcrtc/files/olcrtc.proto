@@ -54,6 +54,11 @@ OLC_BYPASS_DEFAULT="10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 224.0
 #                       with the handler, and a kill-switch that disappears
 #                       when the tunnel dies is not a kill-switch.
 #
+#                       In this mode rule_base means "the priority of that
+#                       static fwmark rule". The handler installs nothing at it,
+#                       and puts its ICMP bypass at rule_base-1 so the bypass
+#                       wins while the tunnel is up and is gone when it is not.
+#
 # Policy-rule band for catchall mode. Deliberately high and not the more
 # obvious 90-110: OpenWrt routers commonly already have fwmark rules around
 # 100-130 for other tunnels (WireGuard at 120/130, for instance). Sitting after
@@ -408,17 +413,33 @@ proto_olcrtc_setup() {
 			fi
 		fi
 	else
-		# mark mode: no policy rules here at all. The fwmark rule and the
-		# kill-switch behind it are declared statically (see the route_mode
-		# comment at the top), so they exist whether or not this handler has
-		# ever run -- which is what makes the kill-switch one.
+		# mark mode: the fwmark rule and the kill-switch behind it are declared
+		# statically (see the route_mode comment at the top), so they exist
+		# whether or not this handler has ever run -- which is what makes the
+		# kill-switch one. rule_base is that static rule's priority.
 		#
-		# No exemptions are needed either: only marked traffic is claimed, and
-		# a firewall MARK rule scoped to a client-facing interface cannot mark
-		# router-originated traffic. ICMP from a marked client still reaches the
-		# TUN, so leave icmp_mode alone -- olcrtc-link rejects it there, which
-		# fails fast instead of blackholing.
-		[ "$icmp_mode" = "bypass" ] && icmp_mode="reject"
+		# No exemptions are needed: only marked traffic is claimed, and a
+		# firewall MARK rule scoped to a client-facing interface cannot mark
+		# anything the router originates.
+		#
+		# The one rule still worth installing here is the ICMP bypass, and it
+		# goes just IN FRONT of the static rule so it wins for marked clients.
+		# It is deliberately unqualified by mark: it does not need to know the
+		# mark (which is set outside this handler), and every earlier lane on the
+		# router already has its own fwmark rule at a lower priority, so their
+		# ICMP is claimed before reaching this one.
+		#
+		# Handler-installed rather than static, so it disappears with the
+		# tunnel: ping works while the lane is up, and marked ICMP falls through
+		# to the `unreachable` rule when it is down instead of quietly leaving
+		# via the WAN. Same reasoning as the UDP/QUIC/IPv6 rejections -- a rule
+		# that only makes sense while the tunnel is up belongs to the tunnel.
+		if [ "$icmp_mode" = "bypass" ]; then
+			if ! _add_rule $((rule_base - 1)) ipproto icmp lookup main; then
+				echo "olcrtc: 'ip rule ipproto' unsupported; ICMP will be rejected instead" >&2
+				icmp_mode="reject"
+			fi
+		fi
 	fi
 
 	proto_export "INTERFACE=$cfg"
