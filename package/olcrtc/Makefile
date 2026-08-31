@@ -29,10 +29,18 @@ define Package/olcrtc
   TITLE:=olcRTC tunnel (netifd protocol)
   URL:=https://github.com/openlibrecommunity/olcrtc
   # hev-socks5-tunnel bridges the TUN device to olcRTC's SOCKS5 listener.
-  # https-dns-proxy resolves over TCP/443 -- the tunnel cannot carry UDP, so
-  # without it every lookup either leaks or fails. Both are hard dependencies
-  # rather than suggestions for that reason.
-  DEPENDS:=+hev-socks5-tunnel +https-dns-proxy +kmod-tun +ip-full
+  #
+  # https-dns-proxy used to be a hard dependency here: in catchall mode the
+  # router's own traffic is routed into the tunnel, so dnsmasq's plain-UDP
+  # queries could not survive and DoH over TCP/443 was the only way to resolve
+  # anything. route_mode 'mark' removes that constraint -- router-originated
+  # traffic never enters the tunnel -- so the resolver is now the operator's
+  # choice, and forcing DoH is actively harmful on a whitelist carrier that
+  # blocks the public DoH endpoints (measured: 1.1.1.1:443, 8.8.8.8:443 and
+  # cloudflare-dns.com:443 all refused, taking DNS down completely).
+  #
+  # Recommend it, do not require it, and say what it is for.
+  DEPENDS:=+hev-socks5-tunnel +kmod-tun +ip-full
   # Dedicated service account. It exists so `ip rule uidrange` can force
   # olcRTC's own signalling to the main routing table -- otherwise the daemon's
   # traffic to the conferencing service is routed into the tunnel it is trying
