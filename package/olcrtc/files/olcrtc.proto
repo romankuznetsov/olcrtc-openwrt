@@ -33,6 +33,7 @@ OLC_BYPASS_DEFAULT="10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 224.0
 #   150      everything else -> $table  (the tunnel)
 OLC_PREF_UID=140
 OLC_PREF_BYPASS=141
+OLC_PREF_ICMP=147
 OLC_PREF_ALL=150
 OLC_SHARE=/usr/share/olcrtc
 OLC_UID=8808
@@ -58,6 +59,7 @@ proto_olcrtc_init_config() {
 	proto_config_add_int     "table"
 	proto_config_add_array   "bypass_cidr"
 	proto_config_add_int     "confirm_timeout"
+	proto_config_add_string  "icmp_mode"
 	proto_config_add_boolean "icmp_reply"
 }
 
@@ -191,7 +193,7 @@ proto_olcrtc_setup() {
 
 	json_get_vars provider room transport key_file socks_port tun_addr mtu \
 	              dns_addr block_quic block_ipv6 default_route metric table \
-	              confirm_timeout icmp_reply
+	              confirm_timeout icmp_mode icmp_reply
 
 	# Defaults. Kept here rather than only in the LuCI form so a
 	# hand-written /etc/config/network entry works too.
@@ -271,8 +273,26 @@ proto_olcrtc_setup() {
 
 	_render_olcrtc_yaml "$olc_yaml"
 	chown olcrtc "$olc_yaml" 2>/dev/null
+	# ICMP cannot traverse the tunnel: olcRTC's SOCKS5 is CONNECT-only and its
+	# server dials tcp4, so there is no path for it. Three ways to handle that:
+	#
+	#   bypass  ICMP is policy-routed out the WAN instead. ping genuinely works
+	#           -- real round-trip times, and unreachable hosts really do fail.
+	#           The cost is that echo requests carry your real address rather
+	#           than the tunnel's. This is the default: a router where ping does
+	#           not work reads as broken, and the alternatives are worse.
+	#   reject  Nothing leaves outside the tunnel. ping fails immediately with
+	#           "Packet filtered" instead of hanging. Choose this if no traffic
+	#           at all may bypass the tunnel.
+	#   reply   The local bridge answers pings itself. Ping always "succeeds",
+	#           including for addresses that cannot exist, so it stops being a
+	#           usable diagnostic. Kept only for compatibility.
+	[ -n "$icmp_mode" ] || icmp_mode="bypass"
+	# Migration from the older boolean.
+	[ "${icmp_reply:-0}" = 1 ] && icmp_mode="reply"
+
 	local hev_icmp=off
-	[ "${icmp_reply:-0}" = 1 ] && hev_icmp=reply
+	[ "$icmp_mode" = "reply" ] && hev_icmp=reply
 	_render_hev_yaml "$hev_yaml" "$iface" "$hev_icmp"
 
 	# Loop prevention. olcRTC's own traffic to the conferencing service must
@@ -310,6 +330,17 @@ proto_olcrtc_setup() {
 		ip rule add pref "$p" to "$cidr" lookup main 2>/dev/null
 		p=$((p + 1))
 	done
+
+	# Send ICMP out the WAN so ping works for real. Uses an ip rule rather than
+	# an nftables mark deliberately: a "route" hook chain re-routes after
+	# marking and loses the socket uid, which silently breaks the uidrange
+	# exemption above. Learned that the hard way.
+	if [ "$icmp_mode" = "bypass" ]; then
+		if ! ip rule add pref "$OLC_PREF_ICMP" ipproto icmp lookup main 2>/dev/null; then
+			echo "olcrtc: 'ip rule ipproto' unsupported; ICMP will be rejected instead" >&2
+			icmp_mode="reject"
+		fi
+	fi
 
 	proto_export "INTERFACE=$cfg"
 	proto_run_command "$cfg" /usr/libexec/olcrtc-link \
@@ -360,7 +391,7 @@ proto_olcrtc_setup() {
 	# Leak prevention. Applied after the interface is up so the rules never
 	# exist without the tunnel behind them.
 	/usr/libexec/olcrtc-link --firewall-up "$iface" \
-		"${block_quic:-1}" "${block_ipv6:-1}" "$use_fwmark" "${icmp_reply:-0}"
+		"${block_quic:-1}" "${block_ipv6:-1}" "$use_fwmark" "$icmp_mode"
 }
 
 proto_olcrtc_teardown() {

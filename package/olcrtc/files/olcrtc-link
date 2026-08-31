@@ -3,7 +3,7 @@
 # and manage the leak-prevention firewall rules.
 #
 #   olcrtc-link <olcrtc.yaml> <hev.yaml> <ifname> <socks_port>
-#   olcrtc-link --firewall-up <ifname> <block_quic> <block_ipv6> [fwmark] [icmp_reply]
+#   olcrtc-link --firewall-up <ifname> <block_quic> <block_ipv6> [fwmark] [icmp_mode]
 #   olcrtc-link --firewall-down <ifname>
 #
 # In the first form this stays in the foreground so netifd's proto_run_command
@@ -32,7 +32,7 @@ err() { logger -t olcrtc-link -p daemon.err  -- "$*"; echo "olcrtc-link: $*" >&2
 # fail fast and fall back (browsers retry QUIC over TCP) instead of hanging.
 
 firewall_up() {
-	ifname="$1"; block_quic="$2"; block_ipv6="$3"; use_fwmark="${4:-0}"; icmp_reply="${5:-0}"
+	ifname="$1"; block_quic="$2"; block_ipv6="$3"; use_fwmark="${4:-0}"; icmp_mode="${5:-bypass}"
 
 	mkdir -p /etc/nftables.d
 
@@ -47,7 +47,7 @@ firewall_up() {
 		# picks the right family itself) and always carry an explicit interface
 		# match so a folded qualifier cannot widen the rule.
 		echo "    oifname \"$ifname\" meta l4proto udp reject with icmpx type admin-prohibited comment \"olcrtc: tunnel cannot carry UDP\""
-		if [ "$icmp_reply" != 1 ]; then
+		if [ "$icmp_mode" = "reject" ]; then
 			# ICMP cannot traverse a SOCKS5 CONNECT tunnel any more than UDP
 			# can. Without this the packets reach the TUN and are silently
 			# dropped, so ping just times out with no reason given. Rejecting
@@ -69,7 +69,7 @@ firewall_up() {
 		# The forward hook does not see traffic the router originates itself,
 		# so `ping` from the router needs its own chain or it still hangs for
 		# the full timeout.
-		if [ "$icmp_reply" != 1 ]; then
+		if [ "$icmp_mode" = "reject" ]; then
 			echo "chain olcrtc_icmp_out {"
 			echo "    type filter hook output priority filter + 10; policy accept;"
 			echo "    oifname \"$ifname\" meta l4proto icmp reject with icmpx type admin-prohibited comment \"olcrtc: tunnel cannot carry ICMP\""
@@ -95,7 +95,7 @@ firewall_up() {
 
 	_drop_chains
 	reload_firewall
-	log "firewall rules applied (quic=$block_quic ipv6=$block_ipv6 fwmark=$use_fwmark icmp_reply=$icmp_reply)"
+	log "firewall rules applied (quic=$block_quic ipv6=$block_ipv6 fwmark=$use_fwmark icmp=$icmp_mode)"
 }
 
 firewall_down() {
@@ -212,7 +212,7 @@ _reap_orphans() {
 	else
 		# busybox without pgrep: match on the exec path in /proc
 		for p in /proc/[0-9]*; do
-			case "$(tr ' ' ' ' < "$p/cmdline" 2>/dev/null)" in
+			case "$(tr '\000' ' ' < "$p/cmdline" 2>/dev/null)" in
 				"$OLC_BIN "*|"$HEV_BIN "*) kill "${p#/proc/}" 2>/dev/null ;;
 			esac
 		done

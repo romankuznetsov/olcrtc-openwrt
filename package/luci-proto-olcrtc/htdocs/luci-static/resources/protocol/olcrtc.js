@@ -91,10 +91,14 @@ return network.registerProtocol('olcrtc', {
 			_('The tunnel is IPv4-only. With this off, LAN IPv6 traffic leaves over the WAN unencrypted while the tunnel appears to be up.'));
 		o.default = '1';
 
-		o = s.taboption('advanced', form.Flag, 'icmp_reply',
-			_('Fake ping replies'),
-			_('ICMP cannot traverse this tunnel, so ping normally fails instantly with "Packet filtered". Enabling this makes the local bridge answer pings itself: ping appears to work, but the reply is synthetic and succeeds even for addresses that do not exist, which makes ping useless as a diagnostic. Off by default.'));
-		o.default = '0';
+		o = s.taboption('advanced', form.ListValue, 'icmp_mode',
+			_('ICMP / ping handling'),
+			_('ICMP cannot travel through the tunnel: olcRTC carries TCP only. This chooses what happens instead.'));
+		o.value('bypass', _('Send via WAN — ping works normally (default)'));
+		o.value('reject', _('Reject — ping fails instantly, nothing leaves the tunnel'));
+		o.value('reply',  _('Fake replies — ping always succeeds, even for dead hosts'));
+		o.default = 'bypass';
+		o.description = _('<b>Send via WAN</b> gives real round-trip times and real failures, at the cost of echo requests carrying your ordinary address rather than the tunnel address. <b>Reject</b> keeps every packet inside the tunnel. <b>Fake replies</b> are answered locally and succeed even for addresses that cannot exist, so ping stops being a usable diagnostic.');
 
 		o = s.taboption('advanced', form.Value, 'dns_addr',
 			_('DNS resolver'),

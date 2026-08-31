@@ -198,10 +198,18 @@ plaintext bootstrap lookup, and make sure dnsmasq has no dead upstreams — a st
 removed instance causes intermittent resolution failures.
 
 **ICMP cannot traverse the tunnel**, for the same reason UDP cannot: olcRTC's SOCKS5 is
-CONNECT-only. `ping` to a tunnelled destination now fails immediately with "Packet filtered"
-instead of timing out silently. `icmp_reply='1'` makes the bridge answer pings locally, but the
-replies are synthetic — verified by pinging 203.0.113.99, a TEST-NET address that cannot answer,
-and getting 0% loss. Test reachability with TCP instead.
+CONNECT-only. `icmp_mode` chooses what happens instead, and the default is `bypass`: ICMP is
+policy-routed out the WAN with `ip rule ... ipproto icmp lookup main`, so ping works normally —
+verified at ~20 ms round trip to 1.1.1.1, while 203.0.113.99 still fails, which is what proves
+the replies are real rather than synthetic.
+
+The trade is that echo requests carry the ordinary WAN address rather than the tunnel's, and
+ping therefore says nothing about whether the tunnel is up. `reject` keeps everything inside the
+tunnel and fails ping instantly; `reply` has the bridge answer locally and is a trap — it
+succeeds even for addresses that cannot exist. Test the tunnel with TCP, not ping.
+
+An `ip rule` is used rather than an nftables mark on purpose: a `route` hook chain re-routes
+after marking and loses the socket uid, which silently breaks the `uidrange` exemption (bug 8).
 
 **`meet.jit.si` requires a token** and cannot be used. Upstream's curated instance list exists
 for this reason; verify a candidate is reachable from *both* ends before committing to it.
