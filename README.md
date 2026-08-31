@@ -62,8 +62,9 @@ That is the intended trade.
 
 ```
 UPSTREAM                          pinned upstream commit + Go version
-.github/workflows/                build matrix, gates, signed release
-docs/                             plan, Phase 0 findings, VPS walkthrough
+.github/workflows/                build gates, package matrix, signed feed + release
+.github/scripts/                  feed index page generator
+docs/                             plan, Phase 0 findings, VPS walkthrough, feed
 scripts/
   build-binary.sh                 cross-compile olcRTC from the pin
   leak-check.sh                   assert no leak, both tunnel states (run on the router)
@@ -73,6 +74,23 @@ package/
   olcrtc/                         binary, netifd protocol handler, firewall
   luci-proto-olcrtc/              the Network -> Interfaces form
 ```
+
+## Installing
+
+**OpenWrt 25.x** — add the signed apk feed once, then install and upgrade
+normally:
+
+```sh
+wget -O /etc/apk/keys/olcrtc-feed.pem   https://<owner>.github.io/olcrtc-openwrt/keys/olcrtc-feed.pem
+echo "https://<owner>.github.io/olcrtc-openwrt/25.12.5/$(apk --print-arch)/packages.adb"   >> /etc/apk/repositories.d/customfeeds.list
+apk update && apk add olcrtc luci-proto-olcrtc
+```
+
+**OpenWrt 24.10** — install the `.ipk` files from a release. There is no signed
+opkg feed, because usign cannot sign the `packages.adb` an apk feed needs and two
+signing schemes were not worth it for one package set.
+
+Details, architectures and maintainer notes: [docs/feed.md](docs/feed.md).
 
 ## Getting started
 

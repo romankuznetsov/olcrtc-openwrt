@@ -31,6 +31,8 @@ jobs:
           # reference netifd helpers that shellcheck cannot see; -x follows
           # sources where possible, and SC1090/SC1091 cover the rest.
           shellcheck -s bash -S warning scripts/*.sh
+          # The feed index generator is plain sh so it can run on a bare runner.
+          shellcheck -s sh -S warning .github/scripts/*.sh
           shellcheck -s sh -S warning -e SC1090,SC1091 \
             package/olcrtc/files/olcrtc.proto \
             package/olcrtc/files/olcrtc-link \
@@ -159,7 +161,10 @@ jobs:
           - { release: '24.10.8', arch: arm_cortex-a7,      sdk: 'sunxi-cortexa7'   }
           - { release: '24.10.8', arch: x86_64,             sdk: 'x86-64'           }
     container:
-      image: openwrt/sdk:${{ matrix.sdk }}-${{ matrix.release }}
+      # ghcr is where the official SDK images live now. --user root because the
+      # image's non-root user cannot write the Actions command files under
+      # /__w/_temp, which makes checkout fail.
+      image: ghcr.io/openwrt/sdk:${{ matrix.sdk }}-${{ matrix.release }}
       options: --user root
     steps:
       - uses: actions/checkout@v4
@@ -175,24 +180,57 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cd /builder
-          cp -r "$GITHUB_WORKSPACE/repo/package/olcrtc" package/
-          cp -r "$GITHUB_WORKSPACE/repo/package/luci-proto-olcrtc" package/
+          SDK="${OPENWRT_SDK_DIR:-/builder}"
+          cd "$SDK"
+          # Some official images are thin wrappers that fetch the SDK lazily.
+          [ -d scripts ] || ./setup.sh
+
+          # Our two packages live in their own linked feed rather than being
+          # copied into package/. Combined with `feeds install -p` below, that
+          # keeps the build to exactly our packages and their real dependencies.
+          FEED="$GITHUB_WORKSPACE/.tmp-feed"
+          rm -rf "$FEED"; mkdir -p "$FEED"
+          cp -a "$GITHUB_WORKSPACE/repo/package/olcrtc" "$FEED/"
+          cp -a "$GITHUB_WORKSPACE/repo/package/luci-proto-olcrtc" "$FEED/"
+
           # The Makefile installs a prebuilt binary rather than compiling, so
           # the SDK's Go version is irrelevant -- this is what decouples us
           # from it. See docs/plan.md.
-          mkdir -p package/olcrtc/prebuilt
+          mkdir -p "$FEED/olcrtc/prebuilt"
           install -m 0755 "$GITHUB_WORKSPACE/bin/olcrtc-${{ matrix.arch }}" \
-                          package/olcrtc/prebuilt/olcrtc
-          ./scripts/feeds update -a >/dev/null
-          ./scripts/feeds install -a >/dev/null
+                          "$FEED/olcrtc/prebuilt/olcrtc"
+
+          # Rebuild feeds.conf from the default each time; the image may be
+          # reused between steps, so appending is not idempotent.
+          cp feeds.conf.default feeds.conf
+          echo "src-link olcrtc $FEED" >> feeds.conf
+
+          # base and luci only. `feeds update -a` also fetches routing,
+          # telephony and video, which costs minutes per matrix job and changes
+          # nothing about the output.
+          ./scripts/feeds update base luci olcrtc >/dev/null
+          ./scripts/feeds install -p olcrtc olcrtc >/dev/null
+          ./scripts/feeds install -p olcrtc luci-proto-olcrtc >/dev/null
+
+          {
+            echo "CONFIG_PACKAGE_olcrtc=y"
+            echo "CONFIG_PACKAGE_luci-proto-olcrtc=y"
+          } > .config
           make defconfig >/dev/null
-          make package/olcrtc/compile V=s
-          make package/luci-proto-olcrtc/compile V=s
+
+          # luci-proto-olcrtc depends on olcrtc, so one target builds both.
+          make package/feeds/olcrtc/luci-proto-olcrtc/compile V=s
+
           mkdir -p "$GITHUB_WORKSPACE/pkgs"
-          find bin/ -name 'olcrtc*.apk' -o -name 'olcrtc*.ipk' \
-               -o -name 'luci-proto-olcrtc*.apk' -o -name 'luci-proto-olcrtc*.ipk' \
-            | xargs -r -I{} cp {} "$GITHUB_WORKSPACE/pkgs/"
+          find bin/ \( -name 'olcrtc[-_]*.apk' -o -name 'olcrtc[-_]*.ipk' \
+                    -o -name 'luci-proto-olcrtc[-_]*.apk' -o -name 'luci-proto-olcrtc[-_]*.ipk' \) \
+            -exec cp {} "$GITHUB_WORKSPACE/pkgs/" \;
+
+          # Assert both packages exist by name. upload-artifact's
+          # if-no-files-found only notices when *nothing* was produced, so a
+          # build that silently dropped one of the two would still pass.
+          ls "$GITHUB_WORKSPACE/pkgs"/olcrtc[-_]*.?pk            >/dev/null
+          ls "$GITHUB_WORKSPACE/pkgs"/luci-proto-olcrtc[-_]*.?pk >/dev/null
           ls -la "$GITHUB_WORKSPACE/pkgs/"
 
       - uses: actions/upload-artifact@v4

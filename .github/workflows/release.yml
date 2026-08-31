@@ -24,6 +24,16 @@ jobs:
   build:
     uses: ./.github/workflows/build.yml
 
+  # The signed apk repository, published to gh-pages. Gated behind build so a
+  # tag that fails lint or upstream's tests publishes nothing at all -- neither
+  # release assets nor a feed.
+  feed:
+    needs: build
+    uses: ./.github/workflows/feed.yml
+    secrets: inherit
+    with:
+      release: '25.12.5'
+
   release:
     name: publish
     runs-on: ubuntu-24.04
@@ -83,20 +93,19 @@ jobs:
           shred -u /tmp/sk
           cat rel/SHA256SUMS.minisig
 
-      - name: build package feed indexes
+      - name: summarise what is published where
         run: |
           set -euo pipefail
-          # A static feed lets users add one line and then `apk add` / `opkg
-          # install` normally, instead of downloading files by hand.
+          # Feed index generation moved to feed.yml, which runs the SDK's own apk
+          # tooling in the SDK container -- the only place the signing keys and
+          # `make package/index` are available. This release ships the loose
+          # files; the feed is the recommended install path for 25.x.
           for relname in rel/*/; do
             r="$(basename "$relname")"
             [ "$r" = "binaries" ] && continue
-            echo "feed: $r ($(find "$relname" -type f | wc -l) packages)"
+            echo "release assets: $r ($(find "$relname" -type f | wc -l) packages)"
           done
-          # Index generation needs the matching apk/opkg tooling and is done in
-          # the SDK containers during the build job in a later iteration; for
-          # now the release ships loose packages plus signed checksums.
-          echo "note: feed indexes are generated in a follow-up step (see docs/plan.md Phase 5)"
+          echo "apk feed (25.x): https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}/"
 
       - name: publish
         uses: softprops/action-gh-release@v2
@@ -112,13 +121,35 @@ jobs:
           body: |
             ## Installing
 
-            **Router** — add the feed or install directly:
+            **OpenWrt 25.x — use the signed feed.** One-time setup, then apk
+            resolves dependencies and upgrades normally:
 
             ```sh
-            # OpenWrt 25.12 (apk)
-            apk add --allow-untrusted ./olcrtc_*.apk ./luci-proto-olcrtc_*.apk
-            # OpenWrt 24.10 (opkg)
+            wget -O /etc/apk/keys/olcrtc-feed.pem \
+              https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/keys/olcrtc-feed.pem
+            echo "https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/25.12.5/$(apk --print-arch)/packages.adb" \
+              >> /etc/apk/repositories.d/customfeeds.list
+            apk update && apk add olcrtc luci-proto-olcrtc
+            ```
+
+            See the [feed index](https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/) for the
+            exact URL for your release and architecture.
+
+            **OpenWrt 24.10 — install the ipk files below.** There is no signed
+            opkg feed: 24.10 signs indexes with usign, which cannot sign the
+            `packages.adb` the apk feed uses, and running two signing schemes was
+            not worth it.
+
+            ```sh
             opkg install ./olcrtc_*.ipk ./luci-proto-olcrtc_*.ipk
+            ```
+
+            Installing an apk by hand instead of via the feed needs
+            `--allow-untrusted`, because a loose file carries no repository
+            signature:
+
+            ```sh
+            apk add --allow-untrusted ./olcrtc_*.apk ./luci-proto-olcrtc_*.apk
             ```
 
             Then set the room and key, and enable the interface:

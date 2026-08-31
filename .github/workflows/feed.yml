@@ -1,0 +1,324 @@
+name: feed
+
+# Builds a SIGNED apk repository and publishes it to gh-pages, so a router adds
+# one line and then installs with apk normally instead of downloading files by
+# hand.
+#
+# apk only, and deliberately. OpenWrt 25.x signs repository metadata
+# (packages.adb) with an EC P-256 keypair; opkg feeds on 24.10 use usign, a
+# different mechanism with different keys that cannot sign packages.adb. Rather
+# than run two signing schemes, 24.10 keeps using the ipk files attached to each
+# GitHub release -- the same split amneziawg-openwrt settled on.
+#
+# Per architecture, not per target/subtarget: olcRTC ships no kernel module, so
+# nothing here depends on the kernel ABI and a second subtarget of the same
+# architecture would produce byte-identical packages. (A kmod is why
+# amneziawg-openwrt has to enumerate every subtarget.)
+
+on:
+  workflow_call:
+    inputs:
+      release:
+        description: 'OpenWrt release to build the feed for (25.x only)'
+        type: string
+        required: false
+        default: '25.12.5'
+  workflow_dispatch:
+    inputs:
+      release:
+        description: 'OpenWrt release to build the feed for (25.x only)'
+        type: string
+        required: false
+        default: '25.12.5'
+
+permissions:
+  contents: write
+
+jobs:
+  guard:
+    name: check release supports apk
+    runs-on: ubuntu-24.04
+    outputs:
+      release: ${{ steps.check.outputs.release }}
+    steps:
+      - id: check
+        run: |
+          set -euo pipefail
+          rel="${{ inputs.release || '25.12.5' }}"
+          major="${rel%%.*}"
+          case "$major" in
+            ''|*[!0-9]*) echo "::error::not a release number: $rel"; exit 1 ;;
+          esac
+          if [ "$major" -lt 25 ]; then
+            echo "::error::$rel predates apk. A signed Pages feed needs packages.adb (25.x+);"
+            echo "::error::for 24.10 use the ipk files attached to the GitHub release."
+            exit 1
+          fi
+          echo "release=$rel" >> "$GITHUB_OUTPUT"
+
+  binaries:
+    name: binary ${{ matrix.arch }}
+    runs-on: ubuntu-24.04
+    needs: guard
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [aarch64_cortex-a53, aarch64_cortex-a72, arm_cortex-a7, x86_64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: read pin
+        id: pin
+        run: |
+          . ./UPSTREAM
+          echo "go=$GO" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ steps.pin.outputs.go }}
+          cache: false
+
+      # Built here rather than reused from build.yml so this workflow also works
+      # on its own via workflow_dispatch, instead of only as part of a release.
+      - name: build
+        run: ./scripts/build-binary.sh "${{ matrix.arch }}" ./out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: feedbin-${{ matrix.arch }}
+          path: out/olcrtc-${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 1
+
+  feed:
+    name: feed ${{ matrix.arch }}
+    runs-on: ubuntu-24.04
+    needs: [guard, binaries]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # One representative SDK target per architecture. The SDK is published
+          # per target/subtarget, the packages are not.
+          - { arch: aarch64_cortex-a53, sdk: mediatek-filogic  }
+          - { arch: aarch64_cortex-a72, sdk: bcm27xx-bcm2711   }
+          - { arch: arm_cortex-a7,      sdk: sunxi-cortexa7    }
+          - { arch: x86_64,             sdk: x86-64            }
+    container:
+      image: ghcr.io/openwrt/sdk:${{ matrix.sdk }}-${{ needs.guard.outputs.release }}
+      # The official SDK image runs as a non-root user that cannot write the
+      # Actions command files under /__w/_temp, so checkout fails without this.
+      options: --user root
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: feedbin-${{ matrix.arch }}
+          path: bin
+
+      - name: stage SDK, keys and an isolated feed
+        env:
+          FEED_KEY:     ${{ secrets.OLCRTC_FEED_APK_PRIVATE_KEY }}
+          FEED_KEY_PUB: ${{ secrets.OLCRTC_FEED_APK_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          WORK="$(pwd)"
+          SDK="${OPENWRT_SDK_DIR:-/builder}"
+          [ -d "$SDK" ] || { echo "::error::no SDK at $SDK"; exit 1; }
+          SDK="$(cd "$SDK" && pwd)"
+          cd "$SDK"
+
+          # Some official SDK images are thin wrappers that fetch the real SDK
+          # on first use.
+          [ -d scripts ] || ./setup.sh
+
+          if [ -z "${FEED_KEY:-}" ] || [ -z "${FEED_KEY_PUB:-}" ]; then
+            echo "::error::OLCRTC_FEED_APK_PRIVATE_KEY / OLCRTC_FEED_APK_PUBLIC_KEY are not set."
+            echo "A feed nobody can verify is worse than no feed, so this fails rather than"
+            echo "publishing unsigned metadata. Generate an EC P-256 keypair with:"
+            echo "  openssl ecparam -name prime256v1 -genkey -noout -out olcrtc-feed.pem"
+            echo "  openssl ec -in olcrtc-feed.pem -pubout > olcrtc-feed.pub.pem"
+            echo "and store them as those two repository secrets. Note these are NOT usign"
+            echo "keys: usign signs opkg indexes and cannot sign packages.adb."
+            exit 1
+          fi
+          printf '%s\n' "$FEED_KEY"     > private-key.pem
+          printf '%s\n' "$FEED_KEY_PUB" > public-key.pem
+          chmod 600 private-key.pem
+          grep -q "BEGIN .*PRIVATE KEY" private-key.pem || { echo "::error::private key is not PEM"; exit 1; }
+          grep -q "BEGIN PUBLIC KEY"    public-key.pem  || { echo "::error::public key is not PEM"; exit 1; }
+
+          # Our packages go in their own linked feed rather than being copied
+          # into package/. Keeping them isolated is what lets `feeds install -p`
+          # below pull in only ours, so an unrelated package symbol cannot end
+          # up selected and built into the published repository.
+          FEED="$WORK/.tmp-olcrtc-feed"
+          rm -rf "$FEED"; mkdir -p "$FEED"
+          cp -a "$WORK/package/olcrtc" "$FEED/"
+          cp -a "$WORK/package/luci-proto-olcrtc" "$FEED/"
+
+          # The Makefile installs a prebuilt binary instead of compiling, which
+          # is what decouples the package from the SDK's Go version.
+          mkdir -p "$FEED/olcrtc/prebuilt"
+          cp "$WORK/bin/olcrtc-${{ matrix.arch }}" "$FEED/olcrtc/prebuilt/olcrtc"
+          chmod 0755 "$FEED/olcrtc/prebuilt/olcrtc"
+
+          # Rebuild feeds.conf from the default every time: the SDK image can be
+          # reused across steps, so appending is not idempotent.
+          [ -f feeds.conf.default ] || { echo "::error::feeds.conf.default missing"; exit 1; }
+          cp feeds.conf.default feeds.conf
+          echo "src-link olcrtc $FEED" >> feeds.conf
+
+          # Only the feeds we actually need. `feeds update -a` also pulls
+          # routing, telephony and video, which costs minutes per matrix job and
+          # buys nothing here.
+          ./scripts/feeds update base luci olcrtc
+          ./scripts/feeds install -p olcrtc olcrtc
+          ./scripts/feeds install -p olcrtc luci-proto-olcrtc
+
+          {
+            echo "CONFIG_PACKAGE_olcrtc=y"
+            echo "CONFIG_PACKAGE_luci-proto-olcrtc=y"
+            # Makes the SDK generate and sign repository metadata.
+            echo "CONFIG_SIGNED_PACKAGES=y"
+          } > .config
+          make defconfig >/dev/null
+
+      - name: build packages into a canonical feed directory
+        run: |
+          set -euo pipefail
+          SDK="$(cd "${OPENWRT_SDK_DIR:-/builder}" && pwd)"
+          cd "$SDK"
+          OUT="$SDK/bin/packages/${{ matrix.arch }}/olcrtc"
+          mkdir -p "$OUT"
+
+          # Building the LuCI package pulls olcrtc in as a dependency, so one
+          # target produces both. PACKAGE_DIR puts them in one directory --
+          # necessary because olcrtc is PKGARCH:=$(ARCH) and luci-proto-olcrtc
+          # is PKGARCH:=all, so by default they land in different trees.
+          make V=s PACKAGE_DIR="$OUT" package/feeds/olcrtc/luci-proto-olcrtc/compile
+
+          # PACKAGE_DIR is inherited by dependency builds, so anything else that
+          # got rebuilt lands here too. Remove it BEFORE indexing, or the
+          # published feed offers packages we never intended to distribute and
+          # shadows the official ones on any router that adds this feed.
+          find "$OUT" -maxdepth 1 -type f -name '*.apk' \
+            ! -name 'olcrtc-*.apk' ! -name 'olcrtc_*.apk' \
+            ! -name 'luci-proto-olcrtc-*.apk' ! -name 'luci-proto-olcrtc_*.apk' \
+            -print -delete
+
+          echo "feed contents:"
+          find "$OUT" -maxdepth 1 -type f -name '*.apk' -printf '  %f\n' | sort
+
+          # Fail loudly if either package is missing: an empty-but-valid feed
+          # would publish and break installs silently.
+          ls "$OUT"/olcrtc[-_]*.apk            >/dev/null
+          ls "$OUT"/luci-proto-olcrtc[-_]*.apk >/dev/null
+
+          # Index only after pruning, so the signature covers what we ship.
+          make package/index V=s PACKAGE_DIR="$OUT"
+          test -s "$OUT/packages.adb"
+          echo "OUT=$OUT" >> "$GITHUB_ENV"
+
+      - name: smoke test the repository index
+        run: |
+          set -euo pipefail
+          SDK="$(cd "${OPENWRT_SDK_DIR:-/builder}" && pwd)"
+          APK="$SDK/staging_dir/host/bin/apk"
+          [ -x "$APK" ] || { echo "::error::host apk tool missing at $APK"; exit 1; }
+
+          # Read the index back with the same tool a router uses. Checking the
+          # files exist is not enough: the index is what apk resolves against.
+          "$APK" adbdump "$OUT/packages.adb" > /tmp/adb.txt
+          grep -q 'olcrtc'            /tmp/adb.txt || { echo "::error::olcrtc missing from packages.adb"; exit 1; }
+          grep -q 'luci-proto-olcrtc' /tmp/adb.txt || { echo "::error::luci-proto-olcrtc missing from packages.adb"; exit 1; }
+          # And prove the feed is not polluted. If base packages appear here,
+          # adding this feed to a router could shadow the official ones.
+          for unwanted in busybox libc ubus netifd; do
+            if grep -qE "(^|[^-])\\b$unwanted\\b" /tmp/adb.txt; then
+              echo "::error::$unwanted leaked into the published feed"; exit 1
+            fi
+          done
+          echo "index ok"
+
+      - name: stage the publish tree
+        run: |
+          set -euo pipefail
+          SDK="$(cd "${OPENWRT_SDK_DIR:-/builder}" && pwd)"
+          REL="${{ needs.guard.outputs.release }}"
+          DEST="$GITHUB_WORKSPACE/feed-publish/$REL/${{ matrix.arch }}"
+          mkdir -p "$DEST"
+          cp -a "$OUT"/. "$DEST"/
+          cat > "$DEST/feed.json" <<EOF
+          {
+            "release": "$REL",
+            "arch": "${{ matrix.arch }}",
+            "sdk_target": "${{ matrix.sdk }}",
+            "commit": "$GITHUB_SHA",
+            "built": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          EOF
+          # The public half of the signing key, so a router can verify the feed.
+          mkdir -p "$GITHUB_WORKSPACE/feed-publish/keys"
+          cp -a "$SDK/public-key.pem" "$GITHUB_WORKSPACE/feed-publish/keys/olcrtc-feed.pem"
+          test -s "$GITHUB_WORKSPACE/feed-publish/keys/olcrtc-feed.pem"
+          find "$GITHUB_WORKSPACE/feed-publish" -type f -printf '  %P\n' | sort
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: feed-${{ needs.guard.outputs.release }}-${{ matrix.arch }}
+          path: feed-publish/
+          if-no-files-found: error
+          retention-days: 14
+
+  deploy:
+    name: publish feed to gh-pages
+    runs-on: ubuntu-24.04
+    needs: [guard, feed]
+    steps:
+      - uses: actions/checkout@v4
+
+      # Each run builds only part of the tree (one release, four architectures).
+      # Publishing just those files would delete every other release already on
+      # gh-pages, so the existing branch is restored first and the new artifacts
+      # are merged on top.
+      - name: restore existing gh-pages content
+        run: |
+          set -euo pipefail
+          mkdir -p site
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
+            git fetch --depth=1 origin gh-pages
+            git --work-tree=site checkout FETCH_HEAD -- .
+            echo "restored $(find site -type f | wc -l) existing file(s)"
+          else
+            echo "no gh-pages branch yet; publishing a fresh tree"
+          fi
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: site
+          pattern: feed-*
+          merge-multiple: true
+
+      - name: require publishable content
+        run: |
+          set -euo pipefail
+          if [ -z "$(find site -name packages.adb -type f -print -quit)" ]; then
+            echo "::error::no packages.adb anywhere -- refusing to publish an empty feed"
+            exit 1
+          fi
+          test -s site/keys/olcrtc-feed.pem
+
+      - name: generate index pages
+        run: |
+          bash .github/scripts/generate-feed-index.sh \
+            "$GITHUB_WORKSPACE/site" \
+            "https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}"
+
+      - uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_branch: gh-pages
+          publish_dir: site
+          enable_jekyll: false
