@@ -27,10 +27,11 @@ if ! uci -q get network.olcrtc >/dev/null; then
 		set network.olcrtc.socks_port='8808'
 		set network.olcrtc.tun_addr='198.18.0.1'
 		set network.olcrtc.mtu='8500'
-		set network.olcrtc.dns_addr='127.0.0.1:5053'
+		set network.olcrtc.dns_addr='1.1.1.1:53'
 		set network.olcrtc.block_quic='1'
 		set network.olcrtc.block_ipv6='1'
 		set network.olcrtc.default_route='1'
+		set network.olcrtc.confirm_timeout='0'
 		set network.olcrtc.metric='10'
 	UCI
 	uci commit network

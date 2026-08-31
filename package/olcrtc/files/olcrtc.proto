@@ -19,6 +19,9 @@
 init_proto "$@"
 
 OLC_RUNDIR=/var/run/olcrtc
+# Never routed into the tunnel. RFC1918 plus link-local, multicast and CGNAT:
+# the tunnel cannot carry them, and capturing them cuts off local management.
+OLC_BYPASS_DEFAULT="10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 224.0.0.0/4 100.64.0.0/10"
 OLC_SHARE=/usr/share/olcrtc
 OLC_UID=8808
 
@@ -40,6 +43,9 @@ proto_olcrtc_init_config() {
 	proto_config_add_boolean "block_ipv6"
 	proto_config_add_boolean "default_route"
 	proto_config_add_int     "metric"
+	proto_config_add_int     "table"
+	proto_config_add_array   "bypass_cidr"
+	proto_config_add_int     "confirm_timeout"
 }
 
 # Can uid/gid 8808 read this file? Parses `ls -ln` because busybox on OpenWrt
@@ -150,9 +156,21 @@ misc:
 EOF
 }
 
+# Remove every rule this handler installs. Idempotent, and safe to call when
+# none are present.
+_clear_rules() {
+	local p=90
+	while [ $p -le 96 ]; do
+		ip rule del pref "$p" 2>/dev/null
+		p=$((p + 1))
+	done
+	ip rule del pref 110 2>/dev/null
+}
+
 proto_olcrtc_setup() {
 	local cfg="$1"
 	local iface="olcrtc0"
+	local OLC_BYPASS
 
 	json_get_vars provider room transport key_file socks_port tun_addr mtu \
 	              dns_addr block_quic block_ipv6 default_route metric
@@ -165,8 +183,17 @@ proto_olcrtc_setup() {
 	[ -n "$socks_port" ] || socks_port=8808
 	[ -n "$tun_addr" ]   || tun_addr="198.18.0.1"
 	[ -n "$mtu" ]        || mtu=8500
-	[ -n "$dns_addr" ]   || dns_addr="127.0.0.1:5053"
+	# Must be resolvable OUTSIDE the tunnel. Pointing this at the router's
+	# local DoH proxy deadlocks bring-up: the proxy runs as root, so it is not
+	# uid-exempted, its traffic goes through the tunnel, and the tunnel needs
+	# DNS to connect. olcRTC is uid-exempted, so a direct resolver always
+	# works. LAN clients still resolve via the DoH proxy through the tunnel.
+	[ -n "$dns_addr" ]   || dns_addr="1.1.1.1:53"
 	[ -n "$metric" ]     || metric=10
+	[ -n "$table" ]      || table=8808
+
+	json_get_values bypass_cidr_list bypass_cidr 2>/dev/null
+	OLC_BYPASS="${bypass_cidr_list:-$OLC_BYPASS_DEFAULT}"
 
 	if [ -z "$room" ]; then
 		echo "olcrtc: 'room' is not set" >&2
@@ -232,14 +259,33 @@ proto_olcrtc_setup() {
 	# use the main table, or it is routed into the tunnel it is building.
 	# Keyed on uid rather than destination because the service addresses are
 	# dynamic and change on failover.
-	ip rule del uidrange "$OLC_UID-$OLC_UID" lookup main pref 100 2>/dev/null
-	if ! ip rule add uidrange "$OLC_UID-$OLC_UID" lookup main pref 100 2>/dev/null; then
+	# The tunnel default lives in its own table, NOT in main. An earlier
+	# version put it in main and exempted olcRTC *to* main, which exempted
+	# nothing -- 0.0.0.0/1 is more specific than the default route, so the
+	# exempted traffic followed the tunnel too and bring-up deadlocked.
+	#
+	#   pref  90  uid 8808      -> main   (WAN; olcRTC reaches the SFU)
+	#   pref 110  everything    -> $table (the tunnel)
+	_clear_rules
+	if ! ip rule add pref 90 uidrange "$OLC_UID-$OLC_UID" lookup main 2>/dev/null; then
 		echo "olcrtc: 'ip rule uidrange' unsupported; falling back to fwmark" >&2
 		# Fallback for kernels/iproute2 without uidrange. The nftables rule
 		# that sets this mark ships in the firewall include.
-		ip rule del fwmark 0x8808 lookup main pref 100 2>/dev/null
-		ip rule add fwmark 0x8808 lookup main pref 100 2>/dev/null
+		ip rule add pref 90 fwmark 0x8808 lookup main 2>/dev/null
 	fi
+
+	# Directly-connected and private destinations must stay on main.
+	#
+	# Without this, the catch-all rule at pref 110 also captures the router's
+	# replies to hosts on its own LAN and WAN subnets -- including the SSH
+	# session you are administering it from. Those replies go into the tunnel,
+	# which cannot route RFC1918, and the router silently becomes unreachable
+	# with no way back in except a power cycle. Learned the hard way.
+	local p=91 cidr
+	for cidr in $OLC_BYPASS; do
+		ip rule add pref "$p" to "$cidr" lookup main 2>/dev/null
+		p=$((p + 1))
+	done
 
 	proto_export "INTERFACE=$cfg"
 	proto_run_command "$cfg" /usr/libexec/olcrtc-link \
@@ -264,14 +310,28 @@ proto_olcrtc_setup() {
 	proto_init_update "$iface" 1
 	proto_add_ipv4_address "$tun_addr" 32
 	if [ "${default_route:-1}" = 1 ]; then
-		# 0.0.0.0/1 + 128.0.0.0/1 rather than a real default route: it
-		# outranks the WAN default without replacing it, so the main table
-		# still resolves the conferencing service for the uid-exempted
-		# daemon.
-		proto_add_ipv4_route "0.0.0.0" 1 "" "" "$metric"
-		proto_add_ipv4_route "128.0.0.0" 1 "" "" "$metric"
+		# A plain default, but in the dedicated table -- nothing competes
+		# with it there, so no /1 split is needed.
+		#
+		# Appended to PROTO_ROUTE by hand because netifd's
+		# proto_add_ipv4_route() exposes only 5 of the 7 route fields and
+		# 'table' is one of the two it drops -- passing it as a 7th argument
+		# is silently ignored and the route lands in main, which is exactly
+		# the deadlock this table exists to avoid.
+		# Field order: target/mask/gw/metric/valid/table/source
+		append PROTO_ROUTE "0.0.0.0/0//$metric//$table/"
 	fi
 	proto_send_update "$cfg"
+
+	if [ "${default_route:-1}" = 1 ]; then
+		ip rule add pref 110 lookup "$table" 2>/dev/null
+	fi
+
+	# Safety net for remote administration: if enabling the default route
+	# cuts off the management path, this takes the interface back down.
+	if [ "${default_route:-1}" = 1 ] && [ "${confirm_timeout:-0}" -gt 0 ] 2>/dev/null; then
+		/usr/libexec/olcrtc-link --arm-revert "$confirm_timeout" "$cfg"
+	fi
 
 	# Leak prevention. Applied after the interface is up so the rules never
 	# exist without the tunnel behind them.
@@ -282,11 +342,15 @@ proto_olcrtc_setup() {
 proto_olcrtc_teardown() {
 	local cfg="$1"
 	local iface="olcrtc0"
+	local table
+	json_get_vars table
+	[ -n "$table" ] || table=8808
 
+	/usr/libexec/olcrtc-link --disarm-revert
 	/usr/libexec/olcrtc-link --firewall-down "$iface"
 
-	ip rule del uidrange "$OLC_UID-$OLC_UID" lookup main pref 100 2>/dev/null
-	ip rule del fwmark 0x8808 lookup main pref 100 2>/dev/null
+	_clear_rules
+	ip route flush table "${table:-8808}" 2>/dev/null
 
 	proto_kill_command "$cfg"
 

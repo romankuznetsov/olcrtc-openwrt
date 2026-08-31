@@ -85,9 +85,56 @@ reload_firewall() {
 	fi
 }
 
+# ------------------------------------------------------- armed auto-revert
+#
+# A safety net for remote administration, in the spirit of "reload in 5" on
+# network gear. Enabling default_route on a router you administer remotely can
+# cut off your own management path; if that happens there is no way back in
+# except physical access. With this armed, the interface tears itself down
+# after N seconds unless somebody confirms the tunnel is healthy:
+#
+#     olcrtc-link --confirm      # cancels the pending revert
+#
+# Off by default (confirm_timeout=0), because on a locally-administered router
+# it is only a way to lose a working tunnel.
+
+CONFIRM_FLAG=/var/run/olcrtc/confirmed
+REVERT_PID=/var/run/olcrtc/revert.pid
+
+arm_revert() {
+	secs="$1"; iface_cfg="$2"
+	rm -f "$CONFIRM_FLAG"
+	(
+		sleep "$secs"
+		if [ -f "$CONFIRM_FLAG" ]; then
+			log "auto-revert cancelled (confirmed)"
+		else
+			err "auto-revert: not confirmed within ${secs}s -- taking $iface_cfg down"
+			ifdown "$iface_cfg"
+		fi
+		rm -f "$REVERT_PID"
+	) &
+	echo $! > "$REVERT_PID"
+	log "auto-revert armed: ${secs}s; run 'olcrtc-link --confirm' to keep it up"
+}
+
+disarm_revert() {
+	[ -f "$REVERT_PID" ] || return 0
+	kill "$(cat "$REVERT_PID")" 2>/dev/null
+	rm -f "$REVERT_PID"
+}
+
 case "${1:-}" in
 	--firewall-up)   shift; firewall_up   "$@"; exit $? ;;
 	--firewall-down) shift; firewall_down "$@"; exit $? ;;
+	--arm-revert)    shift; arm_revert    "$@"; exit $? ;;
+	--disarm-revert) shift; disarm_revert "$@"; exit $? ;;
+	--confirm)
+		mkdir -p "$(dirname "$CONFIRM_FLAG")"
+		: > "$CONFIRM_FLAG"
+		disarm_revert
+		echo "olcrtc: confirmed; auto-revert cancelled"
+		exit 0 ;;
 esac
 
 # ----------------------------------------------------------------- run mode
