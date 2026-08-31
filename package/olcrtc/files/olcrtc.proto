@@ -42,6 +42,42 @@ proto_olcrtc_init_config() {
 	proto_config_add_int     "metric"
 }
 
+# Can uid/gid 8808 read this file? Parses `ls -ln` because busybox on OpenWrt
+# provides neither `su` nor `stat`.
+#
+# ls -ln output:  -rw-r-----  1  0  8808  65  <date>  <path>
+#                 ^perms         ^uid ^gid
+# perms columns:  1 type, 2-4 owner, 5-7 group, 8-10 other.
+_key_readable() {
+	local perms uid gid
+	# shellcheck disable=SC2046
+	set -- $(ls -ln "$1" 2>/dev/null)
+	[ -n "${1:-}" ] || return 1
+	perms="$1"; uid="$3"; gid="$4"
+
+	# world-readable (permissive, but readable)
+	[ "$(echo "$perms" | cut -c8)" = "r" ] && return 0
+	# group-readable and owned by the service group
+	[ "$(echo "$perms" | cut -c5)" = "r" ] && [ "$gid" = "$OLC_UID" ] && return 0
+	# owned by the service user and owner-readable
+	[ "$(echo "$perms" | cut -c2)" = "r" ] && [ "$uid" = "$OLC_UID" ] && return 0
+	return 1
+}
+
+# A readable file inside a directory the service account cannot traverse is
+# still unreachable, and the error names the file rather than the directory.
+# Checking the file alone therefore reports a false OK.
+_dir_traversable() {
+	local perms gid
+	# shellcheck disable=SC2046
+	set -- $(ls -ldn "$1" 2>/dev/null)
+	[ -n "${1:-}" ] || return 1
+	perms="$1"; gid="$4"
+	[ "$(echo "$perms" | cut -c10)" = "x" ] && return 0
+	[ "$(echo "$perms" | cut -c7)" = "x" ] && [ "$gid" = "$OLC_UID" ] && return 0
+	return 1
+}
+
 _render_olcrtc_yaml() {
 	# olcRTC config. The key is referenced by path, never inlined, so the
 	# secret does not land in UCI, in LuCI's form state, or in a config
@@ -148,7 +184,19 @@ proto_olcrtc_setup() {
 
 	# A key that the service account cannot read fails at runtime with a
 	# confusing error, so check it here where the message is useful.
-	if ! su -s /bin/sh olcrtc -c "test -r '$key_file'" 2>/dev/null; then
+	#
+	# Done by parsing `ls -ln` rather than the obvious `su olcrtc -c test -r`:
+	# OpenWrt's busybox ships neither `su` nor `stat` by default, so that form
+	# fails unconditionally and would block the interface from ever starting.
+	if ! _dir_traversable "$(dirname "$key_file")"; then
+		echo "olcrtc: directory '$(dirname "$key_file")' is not traversable by the olcrtc user" >&2
+		echo "olcrtc: fix with: chgrp olcrtc '$(dirname "$key_file")' && chmod 0750 '$(dirname "$key_file")'" >&2
+		proto_notify_error "$cfg" KEY_DIR_PERMISSIONS
+		proto_block_restart "$cfg"
+		return 1
+	fi
+
+	if ! _key_readable "$key_file"; then
 		echo "olcrtc: key file '$key_file' is not readable by the olcrtc user" >&2
 		echo "olcrtc: fix with: chgrp olcrtc '$key_file' && chmod 0640 '$key_file'" >&2
 		proto_notify_error "$cfg" KEY_PERMISSIONS
@@ -166,7 +214,12 @@ proto_olcrtc_setup() {
 		fi
 	fi
 
+	# root:olcrtc, not root:root. A config file chowned to the service
+	# account is still unreachable if the directory above it cannot be
+	# traversed, and the failure reads as "permission denied" on the file,
+	# which sends you looking in the wrong place.
 	mkdir -p "$OLC_RUNDIR"
+	chown "root:$OLC_UID" "$OLC_RUNDIR" 2>/dev/null
 	chmod 0750 "$OLC_RUNDIR"
 	local olc_yaml="$OLC_RUNDIR/olcrtc-$cfg.yaml"
 	local hev_yaml="$OLC_RUNDIR/hev-$cfg.yaml"

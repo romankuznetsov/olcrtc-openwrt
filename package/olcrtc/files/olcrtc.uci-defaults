@@ -7,6 +7,13 @@
 
 . /lib/functions.sh
 
+# The key directory must be traversable by the service account, not just the
+# key file readable -- a 0750 root:root directory makes a correctly-permissioned
+# key inside it unreachable, and the error names the file, not the directory.
+mkdir -p /etc/olcrtc
+chown root:olcrtc /etc/olcrtc 2>/dev/null
+chmod 0750 /etc/olcrtc
+
 # ---------------------------------------------------------------- interface
 if ! uci -q get network.olcrtc >/dev/null; then
 	uci -q batch <<-UCI
