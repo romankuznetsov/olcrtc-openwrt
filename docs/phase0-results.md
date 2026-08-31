@@ -110,3 +110,75 @@ and QUIC blocking moves to nftables, where Phase 4 needed rules anyway, and DNS 
 explicit package dependency.
 
 Checks 3 and 4 need the hardware and do not block Phases 1, 2 or S.
+
+---
+
+# Phase 6 — hardware validation results
+
+**Validated 2026-08-31** on OpenWrt 25.12.2, `aarch64_cortex-a53`, apk, against an
+Ubuntu 24.04 x86_64 VPS.
+
+## Outcome: working
+
+Whole-LAN transparent routing verified end to end — LAN → `olcrtc0` →
+`hev-socks5-tunnel` → olcRTC SOCKS5 → WebRTC datachannel → VPS → internet.
+
+| Check | Result |
+|---|---|
+| Routed probes exiting at the VPS | **10/10** |
+| DNS resolution through the tunnel | resolved (3/3 hosts) |
+| olcRTC reconnects during the run | 0 |
+| Daemon instances after restart | exactly 1 olcRTC + 1 hev |
+| UDP / QUIC / IPv6 rejected | yes / yes / yes |
+| Management path protected | yes (pref 143) |
+| `ip rule uidrange` | supported — fwmark fallback not used |
+
+Measured binary sizes, which Phase 0 deferred: **28 MiB** (aarch64), **30 MiB** (x86_64).
+My earlier 18–25 MB estimate was low.
+
+## Nine bugs found, none visible in review
+
+1. **busybox has neither `su` nor `stat`.** The key-readability check used `su`, which fails
+   unconditionally when absent, so the interface could never start.
+2. **Directory traversal, not file permissions.** `/etc/olcrtc` and `/var/run/olcrtc` were
+   `0750 root:root`; the service account could not traverse them. The error names the *file*,
+   which sends you to the wrong place — and a check that validates only the file reports a
+   false OK.
+3. **nft folded a family qualifier into the reject statement**, turning
+   `meta nfproto ipv6 reject with icmpv6 …` into a bare `reject` matching every forwarded
+   packet. Every rule now carries an explicit interface match and uses `icmpx`.
+4. **`start-stop-daemon -b` discards stdout and stderr**, so startup failures had no
+   diagnosable cause. olcRTC now execs with output to `/var/log/olcrtc.log`.
+5. **netifd's `proto_add_ipv4_route()` exposes only 5 of 7 route fields and drops `table`.**
+   Passing it as a 7th argument is silently ignored and the route lands in `main`.
+6. **Tunnel routes in `main` defeated the uid exemption.** The exemption pointed *at* `main`,
+   where `0.0.0.0/1` outranked the WAN default, so exempted traffic followed the tunnel too.
+   The tunnel default now lives in its own table.
+7. **The catch-all rule captured the router's own management traffic.** Replies to hosts on
+   its LAN and WAN subnets went into a tunnel that cannot carry RFC1918. **This locked the
+   router out and required a power cycle.** Fixed with bypass rules at pref 141-146.
+8. **The fwmark fallback broke the mechanism it backs up.** Its `route` hook re-evaluates
+   routing after marking, losing the socket uid, so the uidrange rule stopped matching. Now
+   emitted only when uidrange is unavailable.
+9. **A hard netifd restart orphans both daemons**, since the supervisor is killed without
+   running its EXIT trap. The replacement then fails with "address already in use" while the
+   orphaned bridge fights the live one over the TUN. Startup now reaps orphans.
+
+## Operational notes
+
+**Allow settling time.** The first 30–60 s after bring-up is unstable while both ends
+negotiate; probes taken in that window fail and then recover. Judge health after it settles,
+not during.
+
+**Newly declared UCI options need a netifd restart**, not just `ifup` — netifd caches the
+protocol schema from `init_config`.
+
+**Do not point olcRTC at the router's own DoH proxy.** That proxy runs unprivileged, so it is
+not uid-exempted; its traffic goes through the tunnel, and the tunnel needs DNS to come up.
+olcRTC uses a direct resolver (uid-exempted, always reachable); LAN clients still resolve
+through DoH over the tunnel. Give the DoH proxy an **IP-literal** resolver URL so it needs no
+plaintext bootstrap lookup, and make sure dnsmasq has no dead upstreams — a stale entry for a
+removed instance causes intermittent resolution failures.
+
+**`meet.jit.si` requires a token** and cannot be used. Upstream's curated instance list exists
+for this reason; verify a candidate is reachable from *both* ends before committing to it.
