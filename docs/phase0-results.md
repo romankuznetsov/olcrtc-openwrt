@@ -132,11 +132,12 @@ Whole-LAN transparent routing verified end to end — LAN → `olcrtc0` →
 | UDP / QUIC / IPv6 rejected | yes / yes / yes |
 | Management path protected | yes (pref 143) |
 | `ip rule uidrange` | supported — fwmark fallback not used |
+| LuCI protocol form | renders (after fixing `getPackageName`) |
 
 Measured binary sizes, which Phase 0 deferred: **28 MiB** (aarch64), **30 MiB** (x86_64).
 My earlier 18–25 MB estimate was low.
 
-## Nine bugs found, none visible in review
+## Ten bugs found, none visible in review
 
 1. **busybox has neither `su` nor `stat`.** The key-readability check used `su`, which fails
    unconditionally when absent, so the interface could never start.
@@ -163,6 +164,14 @@ My earlier 18–25 MB estimate was low.
 9. **A hard netifd restart orphans both daemons**, since the supervisor is killed without
    running its EXIT trap. The replacement then fails with "address already in use" while the
    orphaned bridge fights the live one over the TUN. Startup now reaps orphans.
+
+10. **The LuCI form used the wrong API name.** `getOpkgPackage()` is the older entry point;
+    luci-base 26.089 (OpenWrt 25.12) expects **`getPackageName()`**. With the wrong name — or
+    with the file simply absent — Network → Interfaces shows *"Unsupported protocol type.
+    Install protocol extensions…"* rather than the configuration form. The
+    `registerPatternVirtual` pattern was also wrong: it matched `olcrtc-*` when the device is
+    `olcrtc0`. Verified against the shipped `wireguard.js` on the device, which is the reliable
+    way to pin this API down; `registerPatternVirtual` is used by 18 shipped protocols.
 
 ## Operational notes
 
